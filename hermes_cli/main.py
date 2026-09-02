@@ -11446,6 +11446,7 @@ def cmd_profile(args):
             profile_exists,
             _read_config_model,
             _check_gateway_running,
+            _served_by_running_multiplexer,
             _count_skills,
             _read_distribution_meta,
             _get_wrapper_dir,
@@ -11459,7 +11460,7 @@ def cmd_profile(args):
             sys.exit(1)
         profile_dir = get_profile_dir(name)
         model, provider = _read_config_model(profile_dir)
-        gw = _check_gateway_running(profile_dir)
+        gw = _check_gateway_running(profile_dir) or _served_by_running_multiplexer(name)
         skills = _count_skills(profile_dir)
         dist_name, dist_version, dist_source = _read_distribution_meta(profile_dir)
         alias_name = find_alias_for_profile(name)
