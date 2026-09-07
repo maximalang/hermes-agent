@@ -698,6 +698,9 @@ class Task:
     max_runtime_seconds: Optional[int] = None
     last_heartbeat_at: Optional[int] = None
     current_run_id: Optional[int] = None
+    # Monotonic mutation counter for optimistic concurrency (promote_task_cas);
+    # bumped by the auto-bump trigger on every UPDATE that lands a new status.
+    revision: int = 0
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
     skills: Optional[list] = None            # None = defaults only; [] = explicitly none
@@ -732,6 +735,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            revision=int(g("revision") or 0),
         )
 
 
@@ -941,7 +945,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Optimistic-concurrency counter for promote_task_cas. Starts at 0 and is
+    -- bumped by the tg_tasks_bump_revision trigger whenever an UPDATE lands a
+    -- new status (or any guarded mutation goes through). CAS callers pass the
+    -- revision they read; a mismatch means someone else mutated the row and
+    -- the update is refused. NOT NULL DEFAULT 0 keeps legacy rows and fresh
+    -- INSERTs valid; the migration pass adds the column to old boards.
+    revision             INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3232,6 +3243,208 @@ def promote_task(
         )
 
     return True, None
+
+
+def promote_task_cas(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, expected_status: str,
+    expected_revision: int, expected_current_run_id: Optional[int] = None,
+    reason: Optional[str] = None, dry_run: bool = False,
+) -> dict:
+    """Compare-and-swap promotion for stuck cards (``expected_status`` must be
+    one of ``triage``/``todo``/``blocked``; lands in ``ready``, or ``todo``
+    while parents remain open) with optimistic concurrency on ``tasks.revision``.
+
+    The whole decision+mutation runs inside one ``write_txn`` (BEGIN IMMEDIATE),
+    so concurrent writers serialize on the DB lock and at most one CAS wins.
+    The guard UPDATE re-checks status, revision and run pointer, so a stale
+    ``expected_status``/``expected_revision``/``expected_current_run_id`` mutates
+    NOTHING (no event, no revision bump) — the loser gets ``outcome='conflict'``
+    with the live values to re-read. ``dry_run`` validates the CAS and reports
+    what would land, without writing.
+
+    Outcomes:
+      ``applied``          — transition landed; ``revision`` is the new value
+                             (bumped by ``tg_tasks_bump_revision``).
+      ``already_applied``  — idempotent replay: the card is already past the
+                             transition (``ready``/``running``) and the expected
+                             revision/run pointer still match; no mutation.
+      ``conflict``         — status/revision/run-pointer mismatch; no mutation.
+      ``not_found``        — unknown task id.
+      ``refused``          — ``expected_status`` is not a source this transition
+                             covers, or the card sits in a status it cannot
+                             apply to (e.g. ``done``/``archived``/``review``).
+
+    Identity/history are preserved: only ``status`` changes on the same row;
+    id, created_at, comments, events and runs are untouched. The audit trail
+    is an appended ``promoted_cas`` event carrying actor, reason, source
+    status and both revisions.
+    """
+    source_statuses = ("triage", "todo", "blocked")
+    if expected_status not in source_statuses:
+        raise ValueError(
+            f"expected_status must be one of {', '.join(repr(s) for s in source_statuses)}, "
+            f"got {expected_status!r}"
+        )
+    if not isinstance(expected_revision, int) or isinstance(expected_revision, bool):
+        raise ValueError("expected_revision must be an int")
+    if expected_current_run_id is not None:
+        expected_current_run_id = int(expected_current_run_id)
+
+    def _live_view() -> dict:
+        row = conn.execute(
+            "SELECT status, revision, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return {}
+        return {
+            "status": row["status"],
+            "revision": int(row["revision"] or 0),
+            "current_run_id": _opt_int(row["current_run_id"]),
+        }
+
+    def _conflict(live: dict, error: str) -> dict:
+        return {"outcome": "conflict", "task_id": task_id, **live, "error": error}
+
+    with write_txn(conn):
+        live = _live_view()
+        if not live:
+            return {"outcome": "not_found", "task_id": task_id,
+                    "error": f"task {task_id} not found"}
+
+        if live["status"] not in source_statuses:
+            if live["status"] in ("ready", "running"):
+                # Idempotent replay (E0): the promotion intent is already
+                # satisfied. Our own successful apply bumped the revision by
+                # exactly 1; later dispatcher activity (e.g. a claim moving
+                # ready->running) bumps it further, so any revision strictly
+                # greater than what the caller read counts as applied. A
+                # revision equal to the caller's read means the card was
+                # never in the state the caller believes -> conflict. The run
+                # pointer is deliberately NOT re-checked here: the first
+                # apply consumed it (set NULL) or a fresh run was claimed.
+                if live["revision"] > int(expected_revision):
+                    return {"outcome": "already_applied", "task_id": task_id, **live}
+                return _conflict(
+                    live,
+                    f"revision mismatch: expected {int(expected_revision)}, "
+                    f"live {live['revision']} — re-read the task and retry",
+                )
+            return {
+                "outcome": "refused", "task_id": task_id, **live,
+                "error": (
+                    f"task {task_id} is {live['status']!r}; promote_cas only applies to "
+                    f"{', '.join(repr(s) for s in source_statuses)}"
+                ),
+            }
+
+        if live["status"] != expected_status:
+            return _conflict(
+                live,
+                f"status mismatch: expected {expected_status!r}, live {live['status']!r} "
+                "— re-read the task and retry",
+            )
+        if live["revision"] != int(expected_revision):
+            return _conflict(
+                live,
+                f"revision mismatch: expected {int(expected_revision)}, "
+                f"live {live['revision']} — re-read the task and retry",
+            )
+        if expected_current_run_id is not None and live["current_run_id"] != expected_current_run_id:
+            return _conflict(
+                live,
+                f"current_run_id mismatch: expected {expected_current_run_id}, "
+                f"live {live['current_run_id']}",
+            )
+
+        # Stale-run guard at the real mutation boundary: a card still carrying
+        # a run pointer is (or was) mid-attempt — promoting it without the
+        # caller explicitly acknowledging that pointer could resurrect a card
+        # under a live worker. Pass expected_current_run_id to consume it.
+        if expected_current_run_id is None and live["current_run_id"] is not None:
+            return {
+                "outcome": "refused", "task_id": task_id, **live,
+                "error": (
+                    f"task {task_id} still points at run {live['current_run_id']}; "
+                    "promote_cas refuses stale-run cards unless "
+                    "expected_current_run_id acknowledges the pointer"
+                ),
+            }
+
+        # Dependency gating: never spawn a 'ready' card whose upstream is
+        # unfinished — land in 'todo' instead (same re-gate as unblock/reopen).
+        landing_status = _landing_status_after_parents(conn, task_id)
+        if landing_status == live["status"]:
+            # Would-be no-op (a 'todo' card whose parents are still open):
+            # applying it cannot bump the revision (the trigger fires only on
+            # status change), which would desync the reported revision from
+            # the row. Refuse honestly instead.
+            return {
+                "outcome": "refused", "task_id": task_id, **live,
+                "error": (
+                    f"promotion would be a no-op: task {task_id} is already "
+                    f"{live['status']!r} and its parents remain unfinished"
+                ),
+            }
+        if dry_run:
+            return {
+                "outcome": "would_apply", "task_id": task_id, "status": landing_status,
+                "revision": live["revision"], "previous_status": live["status"],
+            }
+        # Close any leaked open run before the status flip so the invariant
+        # ``current_run_id IS NULL <=> run row terminal`` holds for 'blocked'
+        # sources; a no-op for triage/todo cards.
+        _reclaim_dangling_run(
+            conn, task_id, statuses=source_statuses, now=int(time.time()),
+            note="invariant recovery on promote_cas",
+        )
+
+        # CAS guard UPDATE: re-checks every condition inside the same IMMEDIATE
+        # txn, so a writer that slipped in between the read and this statement
+        # makes rowcount 0 instead of corrupting the transition. The run guard
+        # mirrors ``block_task``'s ``expected_run_id``: absent = don't guard;
+        # ``IS ?`` is SQLite's NULL-safe equality so an expected NULL pointer
+        # compares correctly.
+        if expected_current_run_id is not None:
+            run_guard, run_params = "AND current_run_id IS ?", (expected_current_run_id,)
+        else:
+            run_guard, run_params = "", ()
+        cur = conn.execute(
+            f"""
+            UPDATE tasks
+               SET status = ?, current_run_id = NULL
+             WHERE id = ?
+               AND status = ?
+               AND revision = ?
+               {run_guard}
+            """,
+            (landing_status, task_id, expected_status, int(expected_revision), *run_params),
+        )
+        if cur.rowcount != 1:
+            # Lost the race between the read and the UPDATE (another txn won
+            # the IMMEDIATE lock first and committed): report the live state,
+            # mutate nothing.
+            return _conflict(
+                _live_view(),
+                "task changed during promotion — re-read the task and retry",
+            )
+
+        _append_event(
+            conn, task_id, "promoted_cas",
+            {
+                "actor": actor, "reason": reason, "from_status": live["status"],
+                "to_status": landing_status,
+                "expected_revision": int(expected_revision),
+                "new_revision": live["revision"] + 1,
+            },
+        )
+        return {
+            "outcome": "applied", "task_id": task_id, "status": landing_status,
+            "revision": live["revision"] + 1,
+            "previous_status": live["status"],
+        }
+
+    # Unreachable: write_txn either returns the dict above or raises.
 
 
 def _reclaim_dangling_run(

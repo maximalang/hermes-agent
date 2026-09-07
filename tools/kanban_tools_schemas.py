@@ -513,3 +513,44 @@ KANBAN_LINK_SCHEMA = _schema(
     },
     ["parent_id", "child_id"],
 )
+
+KANBAN_PROMOTE_SCHEMA = _schema(
+    "kanban_promote",
+    (
+        "Compare-and-swap promotion of a stuck task (triage/todo/blocked) to "
+        "'ready' — or 'todo' while parents remain open — guarded by "
+        "expected_status and expected_revision so a stale read mutates "
+        "nothing (outcome 'conflict'). Idempotent: replaying the same "
+        "successful call reports 'already_applied'. Task identity, history, "
+        "comments, runs and links are preserved; the transition is audited "
+        "as a 'promoted_cas' event. Orchestrator-only; requires an explicit "
+        "board and refuses when HERMES_KANBAN_DB pins a different board."
+    ),
+    {
+        "task_id": _prop("string", "Task id to promote."),
+        "expected_status": _prop("string", (
+            "Status you read the task in; must be 'triage', 'todo' or "
+            "'blocked'. Any other live status is a conflict/refusal and "
+            "mutates nothing."
+        )),
+        "expected_revision": _prop("integer", (
+            "The task's 'revision' counter as read via kanban_show. A stale "
+            "revision means someone else mutated the row: outcome 'conflict', "
+            "no mutation — re-read and retry."
+        )),
+        "expected_current_run_id": _prop("integer", (
+            "Optional run-pointer guard. Cards that still carry a "
+            "current_run_id are refused unless this argument acknowledges "
+            "(and consumes) that exact pointer."
+        )),
+        "reason": _prop("string", (
+            "Why the promotion happened; recorded on the promoted_cas audit "
+            "event."
+        )),
+        "dry_run": _prop("boolean", (
+            "Validate only: reports outcome 'would_apply' with the landing "
+            "status, without writing anything."
+        )),
+    },
+    ["task_id", "expected_status", "expected_revision", "board"],
+)

@@ -23,8 +23,8 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_LIST_SCHEMA, KANBAN_PROMOTE_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA,
+    KANBAN_REQUEST_REVIEW_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -309,10 +309,10 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract last_failure_error revision".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
-    "created_at started_at completed_at current_run_id model_override provider_override".split())
+    "created_at started_at completed_at current_run_id model_override provider_override revision".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
@@ -947,10 +947,96 @@ def _handle_link(args: dict, **kw) -> str:
         return _ok(parent_id=parent_id, child_id=child_id)
 
 
+def _promote_cross_board_pin_refusal(board: str) -> Optional[str]:
+    """Refusal message when ``HERMES_KANBAN_DB`` pins a *different* board than
+    the explicit slug. The env pin wins over the board argument inside
+    ``connect()``, so without this check a promote aimed at board B would
+    silently mutate board A — exactly the cross-board write the CAS tool must
+    never allow. ``None`` when unpinned or the pin matches this board."""
+    pinned = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if not pinned:
+        return None
+    try:
+        from pathlib import Path as _Path
+        from hermes_cli import kanban_db as _kb
+        pinned_path = _Path(pinned).expanduser().resolve()
+        natural = (
+            _kb.kanban_home() / "kanban.db"
+            if board == _kb.DEFAULT_BOARD
+            else _kb.board_dir(board) / "kanban.db"
+        ).resolve()
+        if pinned_path == natural:
+            return None
+        return (
+            f"kanban_promote refused: HERMES_KANBAN_DB pins "
+            f"{pinned_path} which is not board {board!r}'s database "
+            f"({natural}). The env pin overrides the board argument — "
+            "promote only operates on the board it explicitly names."
+        )
+    except Exception:
+        # Unresolvable pin (bad path, exotic override): fail closed rather
+        # than promote against an unknown database.
+        return (
+            f"kanban_promote refused: HERMES_KANBAN_DB is set but cannot be "
+            f"matched to board {board!r}; promote requires an unpinned or "
+            "board-matching database."
+        )
+
+
+@_kanban_handler("kanban_promote")
+def _handle_promote(args: dict, **kw) -> str:
+    """CAS promotion of a stuck task; orchestrator-only, explicit board required.
+
+    Structured outcomes from ``promote_task_cas``: ``applied``/``already_applied``/
+    ``would_apply`` (dry run) return ok; ``conflict``/``refused``/``not_found``
+    return a tool error carrying the live values so the caller can re-read."""
+    _reject_delegated_child_mutation("kanban_promote")
+    _require_orchestrator_tool("kanban_promote")
+    tid = args.get("task_id")
+    _check(tid and str(tid).strip(), "task_id is required")
+    tid = str(tid).strip()
+    board = args.get("board")
+    _check(board and str(board).strip(),
+           "board is required: kanban_promote must name its board explicitly "
+           "(it never rides the env-pinned active board)")
+    board = str(board).strip().lower()
+    refusal = _promote_cross_board_pin_refusal(board)
+    if refusal:
+        return tool_error(refusal)
+    expected_status = args.get("expected_status")
+    _check(expected_status and str(expected_status).strip(),
+           "expected_status is required ('triage', 'todo' or 'blocked')")
+    try:
+        expected_revision = int(args.get("expected_revision"))
+    except (TypeError, ValueError):
+        return tool_error("expected_revision must be an integer")
+    expected_run_id = args.get("expected_current_run_id")
+    if expected_run_id is not None:
+        try:
+            expected_run_id = int(expected_run_id)
+        except (TypeError, ValueError):
+            return tool_error("expected_current_run_id must be an integer")
+    reason = _redact_opt(args.get("reason"))
+    dry_run = _parse_bool_arg(args, "dry_run")
+    with _board(board) as (kb, conn):
+        result = kb.promote_task_cas(
+            conn, tid,
+            actor=os.environ.get("HERMES_PROFILE") or "orchestrator",
+            expected_status=str(expected_status).strip().lower(),
+            expected_revision=expected_revision,
+            expected_current_run_id=expected_run_id,
+            reason=reason, dry_run=dry_run)
+    outcome = result.pop("outcome")
+    if outcome in ("conflict", "refused", "not_found"):
+        message = result.pop("error", None) or f"promote_cas {outcome} for {tid}"
+        return tool_error(f"kanban_promote {outcome}: {message}", outcome=outcome, **result)
+    return _ok(outcome=outcome, **result)
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
-# kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+# kanban_list / kanban_unblock / kanban_promote route the board and are hidden from task workers.
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock", "kanban_promote"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
@@ -965,7 +1051,8 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_promote", KANBAN_PROMOTE_SCHEMA, _handle_promote, "⏫"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

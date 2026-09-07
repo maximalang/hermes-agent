@@ -803,6 +803,9 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    # Optimistic-concurrency counter; the auto-bump trigger below is created
+    # only after the column exists on every schema version.
+    ("revision", "revision INTEGER NOT NULL DEFAULT 0"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -854,6 +857,24 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
             else:
                 _add_column_if_missing(conn, "tasks", name, ddl)
+
+    # Revision auto-bump trigger for promote_task_cas. Created AFTER the
+    # ``revision`` column exists (fresh DBs get it from SCHEMA_SQL, legacy DBs
+    # from the ALTER pass above) — same ordering rule as the additive indexes.
+    # Bumping only on status change keeps heartbeat/priority-only updates from
+    # churning revisions; the inner UPDATE never touches ``status`` so the
+    # trigger cannot re-fire (and recursive_triggers is off by default).
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS tg_tasks_bump_revision
+        AFTER UPDATE OF status ON tasks
+        FOR EACH ROW
+        WHEN NEW.status IS NOT OLD.status
+        BEGIN
+            UPDATE tasks SET revision = OLD.revision + 1 WHERE id = OLD.id;
+        END
+        """
+    )
 
     # Indexes over additive ``tasks`` columns must be created AFTER the columns
     # exist: ``executescript`` parses each statement against the live schema,
