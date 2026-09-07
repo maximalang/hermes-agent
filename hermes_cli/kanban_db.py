@@ -3245,6 +3245,22 @@ def promote_task(
     return True, None
 
 
+def _latest_promote_cas_audit(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Payload of the newest ``promoted_cas`` audit event for ``task_id``
+    (or ``None``). Used by the idempotent-replay check to verify the live
+    transition fingerprint matches the caller's intended apply."""
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'promoted_cas' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    parsed = _json_or(row["payload"])
+    return parsed if isinstance(parsed, dict) else None
+
+
 def promote_task_cas(
     conn: sqlite3.Connection, task_id: str, *, actor: str, expected_status: str,
     expected_revision: int, expected_current_run_id: Optional[int] = None,
@@ -3265,10 +3281,16 @@ def promote_task_cas(
     Outcomes:
       ``applied``          — transition landed; ``revision`` is the new value
                              (bumped by ``tg_tasks_bump_revision``).
-      ``already_applied``  — idempotent replay: the card is already past the
-                             transition (``ready``/``running``) and the expected
-                             revision/run pointer still match; no mutation.
-      ``conflict``         — status/revision/run-pointer mismatch; no mutation.
+      ``already_applied``  — idempotent replay of EXACTLY this promotion:
+                             ``revision == expected_revision + 1``, live status
+                             equals the computed landing, ``current_run_id``
+                             is NULL, and the newest ``promoted_cas`` audit
+                             event matches (from_status/expected_revision/
+                             to_status); no mutation. Any later claim/run or
+                             revision drift makes the replay a ``conflict``.
+      ``conflict``         — status/revision/run-pointer mismatch or a stale
+                             replay against a card that has moved on; no
+                             mutation.
       ``not_found``        — unknown task id.
       ``refused``          — ``expected_status`` is not a source this transition
                              covers, or the card sits in a status it cannot
@@ -3314,21 +3336,31 @@ def promote_task_cas(
 
         if live["status"] not in source_statuses:
             if live["status"] in ("ready", "running"):
-                # Idempotent replay (E0): the promotion intent is already
-                # satisfied. Our own successful apply bumped the revision by
-                # exactly 1; later dispatcher activity (e.g. a claim moving
-                # ready->running) bumps it further, so any revision strictly
-                # greater than what the caller read counts as applied. A
-                # revision equal to the caller's read means the card was
-                # never in the state the caller believes -> conflict. The run
-                # pointer is deliberately NOT re-checked here: the first
-                # apply consumed it (set NULL) or a fresh run was claimed.
-                if live["revision"] > int(expected_revision):
+                # Idempotent replay (E0): ``already_applied`` requires the EXACT
+                # fingerprint of our own successful apply — revision bumped by
+                # exactly 1, status still the computed landing, no run pointer
+                # (a later claim/run means the card moved on), and a matching
+                # ``promoted_cas`` audit event. Any other combination is a
+                # stale read: ``conflict`` with live values, zero mutation.
+                landing = _landing_status_after_parents(conn, task_id)
+                audit = _latest_promote_cas_audit(conn, task_id)
+                exact_replay = (
+                    live["revision"] == int(expected_revision) + 1
+                    and live["status"] == landing
+                    and live["current_run_id"] is None
+                    and audit is not None
+                    and audit.get("from_status") == expected_status
+                    and audit.get("expected_revision") == int(expected_revision)
+                    and audit.get("to_status") == landing
+                )
+                if exact_replay:
                     return {"outcome": "already_applied", "task_id": task_id, **live}
                 return _conflict(
                     live,
-                    f"revision mismatch: expected {int(expected_revision)}, "
-                    f"live {live['revision']} — re-read the task and retry",
+                    f"stale promotion replay: expected {expected_status!r} at revision "
+                    f"{int(expected_revision)}, live {live['status']!r} at revision "
+                    f"{live['revision']} with run {live['current_run_id']} "
+                    "— not an exact replay of a prior apply; re-read the task and retry",
                 )
             return {
                 "outcome": "refused", "task_id": task_id, **live,

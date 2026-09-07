@@ -223,12 +223,80 @@ def test_idempotent_replay_reports_already_applied(conn):
     assert kb.get_task(conn, tid).revision == first["revision"]
     kinds = [e.kind for e in kb.list_events(conn, tid)]
     assert kinds.count("promoted_cas") == 1
-    # Same replay while a worker already claimed it (ready->running bumps
-    # revision again): still already_applied, never a mutation.
+
+
+def test_two_revision_stale_replay_conflicts(conn):
+    """The original P0 reproduction: apply blocked rev3 -> ready rev4, then a
+    caller holding an OLDER read (rev2) must NOT see already_applied — the
+    card is past that intent by more than one bump."""
+    tid = kb.create_task(conn, title="stale-replay", assignee="w")
+    _set_status(conn, tid, "blocked")   # rev1
+    _set_status(conn, tid, "ready")     # rev2 — another writer moved it on
+    _set_status(conn, tid, "blocked")   # rev3
+    rev3 = kb.get_task(conn, tid).revision
+    assert rev3 == 3
+    applied = _cas(conn, tid, expected_status="blocked", expected_revision=rev3)
+    assert applied["outcome"] == "applied"
+    assert applied["revision"] == rev3 + 1
+    # Stale caller read rev2 (or anything != rev3): conflict, zero mutation.
+    for stale_rev in (rev3 - 1, rev3 + 5, 0):
+        res = _cas(conn, tid, expected_status="blocked", expected_revision=stale_rev)
+        assert res["outcome"] == "conflict", f"rev {stale_rev}: {res}"
+        assert "stale promotion replay" in res["error"]
+        assert res["revision"] == rev3 + 1  # live values for the re-read
+        _assert_untouched(conn, tid, "ready", rev3 + 1, cas_events=1)
+
+
+def test_post_claim_replay_conflicts(conn):
+    """After the dispatcher claims the promoted card (ready -> running, fresh
+    run pointer), the exact replay must conflict: the card moved on and a
+    re-apply must never be mistaken for idempotent success."""
+    tid = kb.create_task(conn, title="post-claim", assignee="w")
+    _set_status(conn, tid, "blocked")
+    rev = kb.get_task(conn, tid).revision
+    first = _cas(conn, tid, expected_status="blocked", expected_revision=rev)
+    assert first["outcome"] == "applied"
     kb.claim_task(conn, tid)
-    assert kb.get_task(conn, tid).status == "running"
-    replay2 = _cas(conn, tid, expected_status="blocked", expected_revision=rev)
-    assert replay2["outcome"] == "already_applied"
+    task = kb.get_task(conn, tid)
+    assert task.status == "running" and task.current_run_id is not None
+    replay = _cas(conn, tid, expected_status="blocked", expected_revision=rev)
+    assert replay["outcome"] == "conflict"
+    assert "stale promotion replay" in replay["error"]
+    assert replay["revision"] == task.revision
+    assert replay["current_run_id"] == task.current_run_id
+    # Zero mutation: still running under the same run, one audit event.
+    _assert_untouched(conn, tid, "running", task.revision, cas_events=1)
+    assert kb.get_task(conn, tid).current_run_id == task.current_run_id
+
+
+def test_post_block_reopen_replay_conflicts(conn):
+    """Promote -> block -> unblock cycles the card back to a source status at
+    a higher revision: the old replay is stale (conflict), while a FRESH CAS
+    on the live read still applies. Same row, history preserved."""
+    tid = kb.create_task(conn, title="cycle", assignee="w")
+    kb.add_comment(conn, tid, "operator", "before cycle")
+    _set_status(conn, tid, "blocked")
+    rev = kb.get_task(conn, tid).revision
+    first = _cas(conn, tid, expected_status="blocked", expected_revision=rev)
+    assert first["outcome"] == "applied"
+    kb.block_task(conn, tid, reason="hit a wall", kind="needs_input")
+    live_rev = kb.get_task(conn, tid).revision
+    assert live_rev > rev + 1  # block bumped further
+    replay = _cas(conn, tid, expected_status="blocked", expected_revision=rev)
+    assert replay["outcome"] == "conflict"
+    # The card cycled back to a source status, so the ordinary revision guard
+    # catches the stale read (live rev moved past the caller's).
+    assert "revision mismatch" in replay["error"]
+    _assert_untouched(conn, tid, "blocked", live_rev, cas_events=1)
+    # A fresh read re-applies: second promoted_cas event, same task id.
+    second = _cas(conn, tid, expected_status="blocked", expected_revision=live_rev)
+    assert second["outcome"] == "applied"
+    assert second["status"] == "ready"
+    assert second["revision"] == live_rev + 1
+    assert kb.get_task(conn, tid).id == tid
+    assert [c.body for c in kb.list_comments(conn, tid)] == ["before cycle"]
+    kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert kinds.count("promoted_cas") == 2
 
 
 def test_dependency_gating_lands_todo_while_parent_unfinished(conn):
