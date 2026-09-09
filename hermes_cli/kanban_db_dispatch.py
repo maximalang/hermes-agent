@@ -1573,7 +1573,31 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        if spawn_fn is None:
+            # Principal admission is intentionally limited to the audited direct
+            # local Popen path.  Generic/custom spawners keep legacy semantics
+            # and never receive a capability or issuer callback.
+            def _issue_launch_capability() -> str:
+                from hermes_cli.kanban_principal import issue_local_launch
+                from hermes_cli.profiles import normalize_profile_name
+
+                return issue_local_launch(
+                    conn,
+                    board=_kb._normalize_board_slug(board) or _kb.get_current_board(),
+                    task_id=claimed.id,
+                    run_id=int(claimed.current_run_id),
+                    expected_profile=normalize_profile_name(claimed.assignee),
+                    claim_lock=str(claimed.claim_lock),
+                )
+
+            pid = _default_spawn(
+                claimed,
+                str(workspace),
+                board=board,
+                _launch_issuer=_issue_launch_capability,
+            )
+        else:
+            pid = _call_spawn_fn(spawn_fn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -2160,7 +2184,13 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     )
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def _default_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+    _launch_issuer: Optional[Callable[[], str]] = None,
+) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
@@ -2253,15 +2283,29 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    direct_cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
+    cmd = _restart_safe_worker_argv(task, direct_cmd)
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)
+    launch_capability = None
     try:
+        # Wrapped/systemd paths are deliberately unsupported in P2a.  Only the
+        # direct built-in local Popen receives a freshly issued launch grant.
+        if _launch_issuer is not None and cmd == direct_cmd:
+            try:
+                launch_capability = _launch_issuer()
+            except Exception:
+                # Additive compatibility: spawn the legacy worker without a
+                # principal rather than turning admission into a new denial.
+                _kb._log.debug("kanban principal launch issue unavailable")
+            if launch_capability:
+                from hermes_cli.kanban_principal import _LAUNCH_CAPABILITY_ENV
+
+                env[_LAUNCH_CAPABILITY_ENV] = launch_capability
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
@@ -2278,6 +2322,16 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    finally:
+        # Popen has copied the child environment.  Do not retain the raw grant
+        # in the dispatcher mapping or local variable on any success/failure path.
+        try:
+            from hermes_cli.kanban_principal import _LAUNCH_CAPABILITY_ENV
+
+            env.pop(_LAUNCH_CAPABILITY_ENV, None)
+        except Exception:
+            pass
+        launch_capability = None
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
     return proc.pid

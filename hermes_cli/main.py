@@ -3324,8 +3324,34 @@ def _default_to_chat(args) -> None:
     cmd_chat(args)
 
 
+def _capture_and_admit_principal_launch() -> None:
+    """Consume a dispatcher launch grant before normal CLI startup.
+
+    Missing/invalid grants preserve legacy behavior (principal unavailable).
+    Startup imports above this function are part of the documented TCB.
+    """
+    captured = None
+    try:
+        from hermes_cli.kanban_principal import (
+            admit_captured_launch,
+            capture_startup_capability,
+        )
+
+        captured = capture_startup_capability()
+        if captured is not None:
+            admit_captured_launch(captured)
+    except Exception:
+        # Admission is additive: never turn a legacy launch into a permission
+        # denial, and never log exception detail that could contain startup data.
+        pass
+    finally:
+        if captured is not None:
+            captured._clear()
+
+
 def main():
     """Main entry point for hermes CLI."""
+    _capture_and_admit_principal_launch()
     _set_process_title()
     _advertise_agent_env()
 
