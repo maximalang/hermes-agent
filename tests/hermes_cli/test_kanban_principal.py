@@ -4,7 +4,10 @@ No test connects RuntimePrincipal to a Kanban business write.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import contextvars
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -167,6 +170,82 @@ def test_issue_event_contains_hash_only_and_exact_binding(active_run):
     assert raw not in json.dumps([dict(r) for r in event_rows(conn, "principal_launch_issued")])
 
 
+def test_same_active_run_second_issue_is_denied(active_run):
+    conn, binding = active_run
+    issue(conn, binding)
+
+    with pytest.raises(ValueError, match="already has a principal launch issue"):
+        issue(conn, binding)
+
+    assert len(event_rows(conn, "principal_launch_issued")) == 1
+
+
+@pytest.mark.parametrize("prior_state", ["consumed", "expired", "revoked"])
+def test_same_run_remint_is_denied_after_terminal_issue_state(
+    active_run, monkeypatch, prior_state,
+):
+    conn, binding = active_run
+    if prior_state == "expired":
+        monkeypatch.setattr(kp.time, "time", lambda: 1000)
+        raw = issue(conn, binding, startup_timeout_seconds=1)
+        monkeypatch.setattr(kp.time, "time", lambda: 1002)
+    else:
+        raw = issue(conn, binding)
+
+    if prior_state == "consumed":
+        assert kp.admit_captured_launch(capture(monkeypatch, binding, raw)) is not None
+        kp._clear_current_principal_for_tests()
+    elif prior_state == "revoked":
+        issued = event_rows(conn, "principal_launch_issued")[0]
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, binding["task_id"], "principal_launch_revoked",
+                {"version": 1, "issue_event_id": int(issued["id"])},
+                run_id=binding["run_id"],
+            )
+
+    with pytest.raises(ValueError, match="already has a principal launch issue"):
+        issue(conn, binding)
+    assert len(event_rows(conn, "principal_launch_issued")) == 1
+
+
+def test_legacy_multiple_issues_fail_closed_on_consume(active_run, monkeypatch):
+    conn, binding = active_run
+    raw = issue(conn, binding)
+    first_payload = json.loads(event_rows(conn, "principal_launch_issued")[0]["payload"])
+    duplicate = dict(first_payload)
+    duplicate["capability_sha256"] = hashlib.sha256(b"legacy-second-grant").hexdigest()
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, binding["task_id"], "principal_launch_issued", duplicate,
+            run_id=binding["run_id"],
+        )
+
+    assert kp.admit_captured_launch(capture(monkeypatch, binding, raw)) is None
+    assert event_rows(conn, "principal_launch_consumed") == []
+
+
+def test_two_distinct_runs_may_each_have_one_issue(active_run):
+    conn, first = active_run
+    first_raw = issue(conn, first)
+    second_task_id = kb.create_task(conn, title="second launch run", assignee="qa")
+    second_task = kb.claim_task(conn, second_task_id, claimer="test-host:200")
+    assert second_task is not None and second_task.current_run_id and second_task.claim_lock
+    second = {
+        "board": "default",
+        "db_path": first["db_path"],
+        "task_id": second_task_id,
+        "run_id": int(second_task.current_run_id),
+        "profile": "qa",
+        "claim_lock": second_task.claim_lock,
+    }
+
+    second_raw = issue(conn, second)
+
+    assert first_raw != second_raw
+    assert len(event_rows(conn, "principal_launch_issued")) == 2
+
+
 def test_ids_without_secret_do_not_admit(active_run, monkeypatch):
     _conn, binding = active_run
     assert capture(monkeypatch, binding, raw=None) is None
@@ -308,6 +387,81 @@ def test_delegated_child_context_cannot_use_parent_principal(active_run, monkeyp
     assert kp.current_principal() is principal
 
 
+def test_non_dispatcher_context_hides_and_restores_principal(active_run, monkeypatch):
+    from agent.delegation_context import (
+        delegated_child_context,
+        non_dispatcher_owned_context,
+    )
+
+    conn, binding = active_run
+    principal = kp.admit_captured_launch(capture(monkeypatch, binding, issue(conn, binding)))
+    assert principal is not None
+    assert kp.current_principal() is principal
+
+    with delegated_child_context("child-session"):
+        assert kp.current_principal() is None
+    with non_dispatcher_owned_context():
+        assert kp.current_principal() is None
+    assert kp.current_principal() is principal
+
+    copied = contextvars.copy_context()
+    assert copied.run(kp.current_principal) is principal
+
+    async def inherited_owner_task():
+        return await asyncio.create_task(_read_principal())
+
+    async def _read_principal():
+        return kp.current_principal()
+
+    assert asyncio.run(inherited_owner_task()) is principal
+
+
+def test_admission_is_denied_in_non_dispatcher_context(active_run, monkeypatch):
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    conn, binding = active_run
+    raw = issue(conn, binding)
+    captured = capture(monkeypatch, binding, raw)
+    with non_dispatcher_owned_context():
+        assert kp.admit_captured_launch(captured) is None
+        assert kp.current_principal() is None
+    assert event_rows(conn, "principal_launch_consumed") == []
+
+
+def test_startup_deadline_is_exclusive(active_run, monkeypatch):
+    conn, binding = active_run
+    monkeypatch.setattr(kp.time, "time", lambda: 1000)
+    just_before = issue(conn, binding, startup_timeout_seconds=2)
+    monkeypatch.setattr(kp.time, "time", lambda: 1001.999)
+    assert kp.admit_captured_launch(capture(monkeypatch, binding, just_before)) is not None
+
+    second_task_id = kb.create_task(conn, title="deadline exact", assignee="qa")
+    second_task = kb.claim_task(conn, second_task_id, claimer="deadline:exact")
+    exact = {
+        **binding,
+        "task_id": second_task_id,
+        "run_id": int(second_task.current_run_id),
+        "claim_lock": second_task.claim_lock,
+    }
+    monkeypatch.setattr(kp.time, "time", lambda: 1002)
+    exact_raw = issue(conn, exact, startup_timeout_seconds=1)
+    monkeypatch.setattr(kp.time, "time", lambda: 1003)
+    assert kp.admit_captured_launch(capture(monkeypatch, exact, exact_raw)) is None
+
+    third_task_id = kb.create_task(conn, title="deadline after", assignee="qa")
+    third_task = kb.claim_task(conn, third_task_id, claimer="deadline:after")
+    after = {
+        **binding,
+        "task_id": third_task_id,
+        "run_id": int(third_task.current_run_id),
+        "claim_lock": third_task.claim_lock,
+    }
+    monkeypatch.setattr(kp.time, "time", lambda: 1004)
+    after_raw = issue(conn, after, startup_timeout_seconds=1)
+    monkeypatch.setattr(kp.time, "time", lambda: 1006)
+    assert kp.admit_captured_launch(capture(monkeypatch, after, after_raw)) is None
+
+
 def test_concurrent_real_process_consume_has_exactly_one_winner(active_run):
     conn, binding = active_run
     raw = issue(conn, binding)
@@ -327,6 +481,106 @@ def test_concurrent_real_process_consume_has_exactly_one_winner(active_run):
         results.append(json.loads(stdout))
     assert sorted(item["admitted"] for item in results) == [False, True]
     assert len(event_rows(conn, "principal_launch_consumed")) == 1
+
+
+def test_relative_and_case_path_spellings_use_canonical_admission_path(
+    active_run, monkeypatch,
+):
+    conn, binding = active_run
+    raw = issue(conn, binding)
+    monkeypatch.chdir(binding["db_path"].parent)
+    relative = dict(binding, db_path=Path(binding["db_path"].name))
+    assert kp.admit_captured_launch(capture(monkeypatch, relative, raw)) is not None
+
+    if os.name == "nt":
+        kp._clear_current_principal_for_tests()
+        second_task_id = kb.create_task(conn, title="case path launch", assignee="qa")
+        second_task = kb.claim_task(conn, second_task_id, claimer="test-host:case")
+        second = {
+            **binding,
+            "task_id": second_task_id,
+            "run_id": int(second_task.current_run_id),
+            "claim_lock": second_task.claim_lock,
+        }
+        second_raw = issue(conn, second)
+        case_variant = dict(second, db_path=Path(str(binding["db_path"]).upper()))
+        assert kp.admit_captured_launch(capture(monkeypatch, case_variant, second_raw)) is not None
+
+
+def test_wrong_and_copied_database_paths_do_not_admit(active_run, tmp_path, monkeypatch):
+    conn, binding = active_run
+    raw = issue(conn, binding)
+
+    independent_path = tmp_path / "independent.db"
+    independent = kbc.connect(db_path=independent_path)
+    independent.close()
+    assert kp.admit_captured_launch(capture(
+        monkeypatch, dict(binding, db_path=independent_path), raw,
+    )) is None
+
+    copied_path = tmp_path / "copied.db"
+    with sqlite3.connect(copied_path) as copied:
+        conn.backup(copied)
+    assert kp.admit_captured_launch(capture(
+        monkeypatch, dict(binding, db_path=copied_path), raw,
+    )) is None
+    assert kp.admit_captured_launch(capture(monkeypatch, binding, raw)) is not None
+
+
+def test_issuance_rejects_connection_opened_through_symlink(active_run, tmp_path):
+    conn, binding = active_run
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    alias = tmp_path / "issuance-alias.db"
+    try:
+        alias.symlink_to(binding["db_path"])
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+    alias_conn = kbc.connect(db_path=alias)
+    try:
+        with pytest.raises(ValueError, match="canonical SQLite path"):
+            issue(alias_conn, binding)
+        assert event_rows(conn, "principal_launch_issued") == []
+    finally:
+        alias_conn.close()
+
+
+def test_symlink_and_real_path_share_one_global_consume_domain(
+    active_run, tmp_path,
+):
+    conn, binding = active_run
+    raw = issue(conn, binding)
+    assert len(event_rows(conn, "principal_launch_issued")) == 1
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    alias = tmp_path / "consume-alias.db"
+    try:
+        alias.symlink_to(binding["db_path"])
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+
+    # Keep the noncanonical connection alive to reproduce Windows' distinct
+    # alias-named WAL namespace while both consumers must open the real path.
+    alias_conn = kbc.connect(db_path=alias)
+    helper = Path(__file__).with_name("_principal_admission_child.py")
+    contenders = [
+        subprocess.Popen(
+            [sys.executable, str(helper)],
+            env=child_env(dict(binding, db_path=path), raw),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for path in (binding["db_path"], alias)
+    ]
+    try:
+        results = []
+        for proc in contenders:
+            stdout, stderr = proc.communicate(timeout=30)
+            assert proc.returncode == 0, stderr
+            results.append(json.loads(stdout)["admitted"])
+        assert sorted(results) == [False, True]
+        assert len(event_rows(conn, "principal_launch_consumed")) == 1
+    finally:
+        alias_conn.close()
 
 
 def test_consume_event_failure_creates_no_principal(active_run, monkeypatch):
@@ -573,6 +827,62 @@ def test_issue_failure_falls_back_to_legacy_spawn(active_run, tmp_path, monkeypa
         task, str(workspace), board="default", _launch_issuer=unavailable,
     ) == 43
     assert kp._LAUNCH_CAPABILITY_ENV not in seen["env"]
+
+
+def test_popen_failure_leaves_one_pending_issue_without_same_run_remint(
+    active_run, tmp_path, monkeypatch,
+):
+    conn, binding = active_run
+    task = kb.get_task(conn, binding["task_id"])
+    workspace = tmp_path / "failed-spawn-workspace"
+    workspace.mkdir()
+    held = {}
+    real_popen = subprocess.Popen
+
+    def launch_issuer():
+        raw = issue(conn, binding)
+        held["raw"] = raw
+        return raw
+
+    def fail_popen(_cmd, **kwargs):
+        held["env"] = kwargs["env"]
+        raise OSError("synthetic Popen failure")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(kbd, "_worker_argv", lambda *args: ["hermes", "chat"])
+    monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda _task, cmd: cmd)
+    monkeypatch.setattr(kbd, "_open_worker_log", lambda *args: contextlib.nullcontext())
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _profile: str(tmp_path))
+    monkeypatch.setattr("tools.process_registry.systemd_user_bus_env", lambda env: env)
+
+    with pytest.raises(OSError, match="synthetic Popen failure"):
+        kbd._default_spawn(
+            task, str(workspace), board="default", _launch_issuer=launch_issuer,
+        )
+
+    assert kp._LAUNCH_CAPABILITY_ENV not in held["env"]
+    assert len(event_rows(conn, "principal_launch_issued")) == 1
+    with pytest.raises(ValueError, match="already has a principal launch issue"):
+        issue(conn, binding)
+
+    # A retained raw value still represents only the one pending issue. Even if
+    # two processes obtained it, the existing BEGIN IMMEDIATE consume wins once.
+    monkeypatch.setattr(subprocess, "Popen", real_popen)
+    helper = Path(__file__).with_name("_principal_admission_child.py")
+    contenders = [
+        subprocess.Popen(
+            [sys.executable, str(helper)], env=child_env(binding, held["raw"]),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for _ in range(2)
+    ]
+    results = []
+    for proc in contenders:
+        stdout, stderr = proc.communicate(timeout=30)
+        assert proc.returncode == 0, stderr
+        results.append(json.loads(stdout)["admitted"])
+    assert sorted(results) == [False, True]
+    assert len(event_rows(conn, "principal_launch_consumed")) == 1
 
 
 def test_runtime_principal_is_not_json_serializable(active_run, monkeypatch):
