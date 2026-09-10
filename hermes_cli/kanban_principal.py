@@ -74,14 +74,39 @@ _CURRENT_PRINCIPAL: ContextVar[Optional[RuntimePrincipal]] = ContextVar(
 _REGISTERED_PRINCIPALS: weakref.WeakSet[RuntimePrincipal] = weakref.WeakSet()
 
 
-def _canonical_board_identity(conn: sqlite3.Connection) -> str:
+def _main_database_path(conn: sqlite3.Connection) -> Path:
     for row in conn.execute("PRAGMA database_list").fetchall():
         name, filename = row[1], row[2]
         if name == "main":
             if not filename:
                 raise ValueError("principal admission requires a file-backed board")
-            return f"sqlite-file:{os.path.normcase(str(Path(filename).resolve()))}"
+            return Path(filename)
     raise ValueError("principal admission cannot identify the board")
+
+
+def _canonical_local_db_path(path: Path) -> Path:
+    """Resolve one existing local DB path before SQLite selects its WAL domain."""
+    return Path(path).expanduser().resolve(strict=True)
+
+
+def _path_identity(path: Path) -> str:
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _canonical_board_identity(conn: sqlite3.Connection) -> str:
+    return f"sqlite-file:{_path_identity(_canonical_local_db_path(_main_database_path(conn)))}"
+
+
+def _require_canonical_connection_path(conn: sqlite3.Connection) -> Path:
+    """Reject an issuer connection already opened through an alias path."""
+    opened = _main_database_path(conn)
+    if not opened.is_absolute():
+        opened = Path.cwd() / opened
+    opened = Path(os.path.abspath(str(opened)))
+    canonical = _canonical_local_db_path(opened)
+    if _path_identity(opened) != _path_identity(canonical):
+        raise ValueError("principal launch issuance requires a canonical SQLite path")
+    return canonical
 
 
 def _payload(row: sqlite3.Row) -> dict:
@@ -179,12 +204,20 @@ def issue_local_launch(
     now = int(time.time())
     try:
         with kb.write_txn(conn):
+            board_identity = f"sqlite-file:{_path_identity(_require_canonical_connection_path(conn))}"
             claim = _active_claim(
                 conn, task_id=task_id, run_id=run_id,
                 profile=expected_profile, claim_lock=claim_lock, now=now,
             )
             if claim is None:
                 raise ValueError("launch claim is not current")
+            prior_issue = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id=? AND run_id=? AND kind='principal_launch_issued' LIMIT 1",
+                (task_id, run_id),
+            ).fetchone()
+            if prior_issue is not None:
+                raise ValueError("exact run already has a principal launch issue")
             deadline = min(
                 now + timeout,
                 int(claim["task_claim_expires"]),
@@ -195,7 +228,7 @@ def issue_local_launch(
                 {
                     "version": _EVENT_VERSION,
                     "board": board,
-                    "board_identity": _canonical_board_identity(conn),
+                    "board_identity": board_identity,
                     "task_id": task_id,
                     "run_id": run_id,
                     "expected_profile": expected_profile,
@@ -261,6 +294,15 @@ def _register(binding: dict) -> RuntimePrincipal:
     return principal
 
 
+def _dispatcher_owned_worker_context() -> bool:
+    """Fail closed unless the shared owner-context predicate confirms ownership."""
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+        return bool(is_dispatcher_owned_worker_context())
+    except Exception:
+        return False
+
+
 def admit_captured_launch(captured: Optional[_CapturedLaunch]) -> Optional[RuntimePrincipal]:
     """Consume once under BEGIN IMMEDIATE; register only after commit succeeds."""
     if not isinstance(captured, _CapturedLaunch):
@@ -269,27 +311,29 @@ def admit_captured_launch(captured: Optional[_CapturedLaunch]) -> Optional[Runti
     if raw is None:
         return None
     try:
+        if not _dispatcher_owned_worker_context():
+            return None
         digest = hashlib.sha256(raw.encode("ascii")).hexdigest()
         from hermes_cli import kanban_db as kb
         from hermes_cli.kanban_db_connect import connect_closing
 
-        with connect_closing(db_path=captured.db_path) as conn:
+        canonical_db_path = _canonical_local_db_path(captured.db_path)
+        with connect_closing(db_path=canonical_db_path) as conn:
             with kb.write_txn(conn):
-                issue_row = issue = None
                 rows = conn.execute(
                     "SELECT id, payload FROM task_events "
-                    "WHERE task_id=? AND run_id=? AND kind='principal_launch_issued' "
-                    "ORDER BY id DESC",
+                    "WHERE task_id=? AND run_id=? AND kind='principal_launch_issued'",
                     (captured.task_id, captured.run_id),
                 ).fetchall()
-                for candidate in rows:
-                    candidate_payload = _payload(candidate)
-                    if hmac.compare_digest(
-                        str(candidate_payload.get("capability_sha256", "")), digest,
-                    ):
-                        issue_row, issue = candidate, candidate_payload
-                        break
-                if issue_row is None or issue is None:
+                # Vulnerable pre-fix databases may contain multiple issue
+                # generations for one run. Their authority is ambiguous.
+                if len(rows) != 1:
+                    return None
+                issue_row = rows[0]
+                issue = _payload(issue_row)
+                if not hmac.compare_digest(
+                    str(issue.get("capability_sha256", "")), digest,
+                ):
                     return None
 
                 issue_id = int(issue_row["id"])
@@ -314,7 +358,7 @@ def admit_captured_launch(captured: Optional[_CapturedLaunch]) -> Optional[Runti
                         and int(issue.get("run_id", 0)) == captured.run_id
                         and issue.get("expected_profile") == captured.profile
                         and issue.get("claim_lock") == captured.claim_lock
-                        and int(issue.get("startup_deadline", 0)) >= now
+                        and int(issue.get("startup_deadline", 0)) > now
                     )
                 except (TypeError, ValueError):
                     static_valid = False
@@ -354,14 +398,9 @@ def _is_registered_principal(value: object) -> bool:
 
 
 def current_principal() -> Optional[RuntimePrincipal]:
-    """Return a registry principal, except inside delegated-child context."""
-    try:
-        from agent.delegation_context import is_delegated_child_process_context
-        if is_delegated_child_process_context():
-            return None
-    except Exception:
-        if os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"):
-            return None
+    """Return a registry principal only in dispatcher-owned worker context."""
+    if not _dispatcher_owned_worker_context():
+        return None
     principal = _CURRENT_PRINCIPAL.get()
     return principal if _is_registered_principal(principal) else None
 
