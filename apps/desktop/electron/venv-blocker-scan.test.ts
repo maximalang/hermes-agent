@@ -253,6 +253,66 @@ describe('parseVenvBlockerScanOutput', () => {
     assert.equal(o.result.processes[0]?.safeToStop, false)
   })
 
+  it('classifies scanner-trusted fleet workers as safe to stop (fleet patch 18.09)', () => {
+    const o = parseVenvBlockerScanOutput(
+      ok({
+        blocked: true,
+        processes: [
+          {
+            pid: 23312,
+            name: 'python.exe',
+            cmdline: 'C:\\Hermes\\venv\\Scripts\\python.exe -m hermes_cli.main -p tech --cli',
+            kind: 'fleet-worker',
+            safeToStop: true,
+            label: 'tech',
+            createTime: 1722798111.5
+          }
+        ]
+      })
+    )
+
+    assert.equal(o.kind, 'blocked')
+
+    if (o.kind !== 'blocked') {
+      return
+    }
+
+    assert.deepEqual(o.result.processes[0], {
+      pid: 23312,
+      name: 'python.exe',
+      cmdline: 'C:\\Hermes\\venv\\Scripts\\python.exe -m hermes_cli.main -p tech --cli',
+      kind: 'fleet-worker',
+      safeToStop: true,
+      label: 'tech',
+      createTime: 1722798111.5
+    })
+  })
+
+  it('does not trust a fleet-worker claim without scanner identity metadata', () => {
+    const o = parseVenvBlockerScanOutput(
+      ok({
+        blocked: true,
+        processes: [
+          {
+            pid: 23312,
+            name: 'python.exe',
+            cmdline: 'python.exe -m hermes_cli.main -p tech --cli'
+            // no kind/safeToStop/createTime hints — must NOT be trusted
+          }
+        ]
+      })
+    )
+
+    assert.equal(o.kind, 'blocked')
+
+    if (o.kind !== 'blocked') {
+      return
+    }
+
+    assert.equal(o.result.processes[0]?.kind, 'other')
+    assert.equal(o.result.processes[0]?.safeToStop, false)
+  })
+
   it('malformed JSON', () => {
     assert.equal(parseVenvBlockerScanOutput('not json').kind, 'probe-failure')
   })
@@ -432,5 +492,50 @@ describe('stopSafeVenvBlockers', () => {
       }
     ])
     assert.deepEqual(outcome, { stopped: [47484], failed: [] })
+  })
+
+  it('also stops fleet-worker blockers (fleet patch 18.09)', async () => {
+    const calls: Array<{ command: string; args: string[] }> = []
+
+    const exec = (async (command: string, args: string[]) => {
+      calls.push({ command, args })
+
+      return { stdout: '', stderr: '' }
+    }) as any
+
+    const outcome = await stopSafeVenvBlockers(
+      '/update/root',
+      {
+        blocked: true,
+        processes: [
+          {
+            pid: 23312,
+            name: 'python.exe',
+            cmdline: 'python.exe -m hermes_cli.main -p tech --cli',
+            kind: 'fleet-worker',
+            safeToStop: true,
+            label: 'tech',
+            createTime: 1722798111.5
+          },
+          {
+            pid: 7,
+            name: 'python.exe',
+            cmdline: 'python.exe -m hermes_cli.main -p tech',
+            kind: 'other',
+            safeToStop: false
+          }
+        ]
+      },
+      exec,
+      () => 'C:\\Hermes\\venv\\Scripts\\python.exe'
+    )
+
+    assert.deepEqual(calls, [
+      {
+        command: 'C:\\Hermes\\venv\\Scripts\\python.exe',
+        args: ['-m', 'hermes_cli._scan_venv_blockers', '--terminate-safe', '23312', '1722798111.5']
+      }
+    ])
+    assert.deepEqual(outcome, { stopped: [23312], failed: [] })
   })
 })

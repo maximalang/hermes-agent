@@ -17,6 +17,7 @@ import pytest
 
 import agent.redact as redact_module
 from hermes_cli._scan_venv_blockers import (
+    _classify_fleet_worker_args,
     _classify_local_preview_args,
     _is_pausable_gateway,
     _probe_fail_json,
@@ -117,6 +118,81 @@ def test_classify_local_preview_args_preserves_full_directory_label_and_port() -
         "label": "Example Preview",
         "port": 8766,
     }
+
+
+# ---------------------------------------------------------------------------
+# _classify_fleet_worker_args (fleet patch 18.09: dispatcher CLI workers and
+# execute_code kernels are safe-stoppable; interactive REPLs are NOT)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_fleet_worker_cli_worker_is_safe_with_profile_label() -> None:
+    args = [
+        r"C:\Users\max\AppData\Local\hermes\hermes-agent\venv\Scripts\python.exe",
+        "-m",
+        "hermes_cli.main",
+        "-p",
+        "tech",
+        "--cli",
+        "--accept-hooks",
+    ]
+
+    result = _classify_fleet_worker_args(args)
+    assert result["kind"] == "fleet-worker"
+    assert result["safeToStop"] is True
+    assert result["label"] == "tech"
+
+
+def test_classify_fleet_worker_long_profile_flag() -> None:
+    args = [
+        r"C:\Hermes\venv\Scripts\python.exe",
+        "-m",
+        "hermes_cli.main",
+        "--profile",
+        "qa",
+        "--cli",
+    ]
+
+    result = _classify_fleet_worker_args(args)
+    assert result["kind"] == "fleet-worker"
+    assert result["label"] == "qa"
+
+
+def test_classify_fleet_worker_execute_code_kernel_is_safe() -> None:
+    args = [
+        r"C:\Hermes\.hermes-runtime\python\gen\python.exe",
+        "-c",
+        "import os, runpy, site, sys;site.addsitedir('C:\\Users\\max\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages')",
+    ]
+
+    result = _classify_fleet_worker_args(args)
+    assert result["kind"] == "fleet-worker"
+    assert result["safeToStop"] is True
+    assert result["label"] == "kernel"
+
+
+def test_classify_fleet_worker_interactive_repl_is_not_safe() -> None:
+    """`hermes -p tech` WITHOUT --cli is an interactive TUI the user may be
+    typing into — must stay a foreign blocker."""
+    args = [r"C:\Hermes\venv\Scripts\python.exe", "-m", "hermes_cli.main", "-p", "tech"]
+    assert _classify_fleet_worker_args(args) == {}
+
+
+def test_classify_fleet_worker_gateway_run_is_not_safe() -> None:
+    """Gateway processes are paused by the updater itself, never classified
+    here (defense in depth — main() exempts them before classification)."""
+    args = [r"C:\Hermes\venv\Scripts\python.exe", "-m", "hermes_cli.main", "--profile", "company", "gateway", "run", "--cli"]
+    assert _classify_fleet_worker_args(args) == {}
+
+
+def test_classify_fleet_worker_serve_backend_is_not_safe() -> None:
+    args = [r"C:\Hermes\venv\Scripts\python.exe", "-m", "hermes_cli.main", "--profile", "default", "serve", "--host", "127.0.0.1"]
+    assert _classify_fleet_worker_args(args) == {}
+
+
+def test_classify_fleet_worker_rejects_non_string_args() -> None:
+    assert _classify_fleet_worker_args(None) == {}
+    assert _classify_fleet_worker_args(["-m", "hermes_cli.main", 42, "--cli"]) == {}
 
 
 def test_classify_local_preview_args_rejects_arbitrary_python_process() -> None:

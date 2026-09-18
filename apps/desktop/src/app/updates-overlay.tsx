@@ -500,7 +500,9 @@ export function BlockerView({
   const { t } = useI18n()
   const u = t.updates
 
-  const safeBlockers = blockers.filter(blocker => blocker.kind === 'local-preview' && blocker.safeToStop)
+  const safeBlockers = blockers.filter(
+    blocker => (blocker.kind === 'local-preview' || blocker.kind === 'fleet-worker') && blocker.safeToStop
+  )
   const hasForeignBlockers = safeBlockers.length !== blockers.length
   const title = hasForeignBlockers ? u.foreignBlockerTitle : u.blockerTitle
 
@@ -525,11 +527,18 @@ export function BlockerView({
       <div className="grid gap-2">
         {blockers.map(blocker => {
           const isSafePreview = blocker.kind === 'local-preview' && blocker.safeToStop
+          const isFleetWorker = blocker.kind === 'fleet-worker' && blocker.safeToStop
 
           return (
             <div className="rounded-lg border border-border/70 bg-muted/35 px-3 py-2.5" key={blocker.pid}>
               <div className="text-sm font-medium">
-                {isSafePreview ? blocker.label || u.localPreview : blocker.name}
+                {isSafePreview
+                  ? blocker.label || u.localPreview
+                  : isFleetWorker
+                    ? blocker.label
+                      ? `${u.fleetWorker} · ${blocker.label}`
+                      : u.fleetWorker
+                    : blocker.name}
               </div>
               <div className="text-xs text-muted-foreground">
                 {isSafePreview && blocker.port ? u.portLabel(blocker.port) : u.pidLabel(blocker.pid)}

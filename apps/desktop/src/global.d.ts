@@ -730,7 +730,7 @@ export interface DesktopUpdateBlocker {
   pid: number
   name: string
   cmdline: string
-  kind: 'local-preview' | 'other'
+  kind: 'local-preview' | 'fleet-worker' | 'other'
   safeToStop: boolean
   label?: string
   port?: number

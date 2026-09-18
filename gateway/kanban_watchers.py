@@ -27,6 +27,7 @@ from gateway.kanban_watchers_common import (
 from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
 from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
+    _PERMISSION_ERROR_ALERT_THRESHOLD,
     _log_spawn_results,
     _resolve_dispatcher_settings,
 )
@@ -35,6 +36,40 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
+
+
+# ---- Fleet-alert escalation (t_baed78d9: silent stuck-dispatcher outage) ----
+
+_FLEET_ALERT_PREFIX = "[FLEET ALERT]"
+_FLEET_ALERT_RECOVERY_PREFIX = "[FLEET ALERT RESOLVED]"
+_FLEET_ALERT_MIN_INTERVAL_SECONDS = 3600  # per-kind re-alert throttle
+
+
+def _fleet_alert_boards(slugs: list) -> str:
+    return ", ".join(slugs) if slugs else "(none)"
+
+
+async def _send_fleet_alert_notification(self, content: str) -> None:
+    """Best-effort delivery of a fleet alert to every home channel.
+
+    The gateway's messaging platforms are the only alert channel that reaches a
+    human without someone tailing the logs — the 2026-09-18 incident's 'stuck'
+    WARNING fired for 40+ minutes and nobody saw it. Failures are logged and
+    swallowed: alerting must never break the tick loop.
+    """
+    try:
+        for platform, _platform_cfg, home, transport in self._home_channel_transports():
+            try:
+                await self._send_home_channel_message(
+                    platform, home, transport,
+                    content,
+                    "kanban fleet alert: %s/%s delivery failed: %%s",
+                )
+            except Exception as exc:
+                logger.warning("kanban fleet alert: %s/%s delivery failed: %s",
+                               platform.value, home.chat_id, exc)
+    except Exception:
+        logger.exception("kanban fleet alert: notification resolution failed")
 
 
 class GatewayKanbanWatchersMixin:
@@ -274,6 +309,21 @@ class GatewayKanbanWatchersMixin:
         last_warn_at = 0
         results: Optional[list] = None
         dispatcher = _KanbanDispatcher(_kb, settings)
+        # Fleet-alert escalation state: boards stuck on persistent PermissionError
+        # are surfaced beyond the logs (home-channel push), once per hour per
+        # incident, with a one-shot recovery notice when dispatch heals.
+        perm_alerted_boards: set = set()
+        perm_alert_last_sent_at = 0
+        perm_alert_active = False
+
+        def _permission_alert_boards() -> list:
+            # The threshold is read from the dispatcher module constant (not the
+            # possibly-stubbed class) so partial test doubles stay harmless.
+            streaks = getattr(dispatcher, "permission_error_streaks", {}) or {}
+            return sorted(
+                slug for slug, streak in streaks.items()
+                if streak >= _PERMISSION_ERROR_ALERT_THRESHOLD
+            )
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
@@ -303,7 +353,52 @@ class GatewayKanbanWatchersMixin:
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                # ---- Fleet-alert escalation (persistent PermissionError) ----
                 now = int(time.time())
+                alert_boards = (
+                    _permission_alert_boards()
+                    if _kanban_dispatch_allowed() else []
+                )
+                if alert_boards:
+                    if not perm_alert_active:
+                        # Incident onset: escalate immediately, past the throttle.
+                        perm_alert_active = True
+                        perm_alert_last_sent_at = now
+                        await _send_fleet_alert_notification(
+                            self,
+                            f"{_FLEET_ALERT_PREFIX} kanban dispatcher: dispatch "
+                            f"persistently failing with PermissionError on boards: "
+                            f"{_fleet_alert_boards(alert_boards)}. No tasks are "
+                            f"spawning fleet-wide until access is restored. Check "
+                            f"gateway.log for the delegate-child fence / filesystem "
+                            f"permissions.",
+                        )
+                        logger.error(
+                            "[FLEET ALERT] kanban dispatcher: dispatch persistently "
+                            "failing with PermissionError on boards: %s — escalated "
+                            "to fleet alert.", _fleet_alert_boards(alert_boards),
+                        )
+                    elif now - perm_alert_last_sent_at >= _FLEET_ALERT_MIN_INTERVAL_SECONDS:
+                        perm_alert_last_sent_at = now
+                        await _send_fleet_alert_notification(
+                            self,
+                            f"{_FLEET_ALERT_PREFIX} kanban dispatcher: STILL failing "
+                            f"with PermissionError on boards: "
+                            f"{_fleet_alert_boards(alert_boards)}.",
+                        )
+                    perm_alerted_boards = set(alert_boards)
+                elif perm_alert_active:
+                    # Healed: every board cleared its streak — send one recovery
+                    # notice and re-arm.
+                    perm_alert_active = False
+                    recovered = sorted(perm_alerted_boards)
+                    perm_alerted_boards = set()
+                    await _send_fleet_alert_notification(
+                        self,
+                        f"{_FLEET_ALERT_RECOVERY_PREFIX} kanban dispatcher: "
+                        f"PermissionError condition cleared on boards: "
+                        f"{_fleet_alert_boards(recovered)}; dispatch resumed.",
+                    )
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
                     logger.warning(

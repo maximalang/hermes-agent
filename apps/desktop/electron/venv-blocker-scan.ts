@@ -18,7 +18,7 @@ const execFileAsync = promisify(execFile)
 // Types
 // ---------------------------------------------------------------------------
 
-export type VenvBlockerKind = 'local-preview' | 'other'
+export type VenvBlockerKind = 'local-preview' | 'fleet-worker' | 'other'
 
 export interface VenvBlockerProcess {
   pid: number
@@ -63,12 +63,32 @@ function classifyVenvBlocker(
   const isPython = /^python(?:w)?(?:\.exe)?$/i.test(process.name)
   const hintedCreateTime = typeof hints?.createTime === 'number' ? hints.createTime : undefined
 
-  const trustedScannerIdentity =
-    hints?.kind === 'local-preview' &&
-    hints.safeToStop === true &&
+  const hasTrustedIdentity =
     hintedCreateTime !== undefined &&
     Number.isFinite(hintedCreateTime) &&
-    hintedCreateTime > 0
+    hintedCreateTime > 0 &&
+    hints?.safeToStop === true
+
+  // Fleet CLI workers / execute_code kernels (fleet patch, owner-approved
+  // 2026-09-18): the scanner classifies them via exact psutil argv as
+  // safeToStop with kind 'fleet-worker'. The dispatcher reconciles orphaned
+  // kanban tasks, so stopping them mid-update is recoverable. Trust ONLY the
+  // scanner's identity metadata — never the (truncated) display cmdline.
+  if (isPython && hasTrustedIdentity && hints?.kind === 'fleet-worker') {
+    const hintedLabel = typeof hints?.label === 'string' ? hints.label.trim() : ''
+
+    return {
+      ...process,
+      kind: 'fleet-worker',
+      safeToStop: true,
+      ...(hintedLabel ? { label: hintedLabel } : {}),
+      createTime: hintedCreateTime
+    }
+  }
+
+  const trustedScannerIdentity =
+    hints?.kind === 'local-preview' &&
+    hasTrustedIdentity
 
   if (!isPython || !moduleMatch || !trustedScannerIdentity) {
     return { ...process, kind: 'other', safeToStop: false }
@@ -98,8 +118,10 @@ function classifyVenvBlocker(
 }
 
 /**
- * Stop only blockers that the fresh scanner identified as Python static-file
- * preview servers. Unknown Python/Hermes processes are deliberately ignored.
+ * Stop only blockers that the fresh scanner classified as safe to stop:
+ * Python static-file preview servers and fleet CLI workers / execute_code
+ * kernels (fleet patch: the dispatcher reconciles orphaned kanban tasks).
+ * Unknown Python/Hermes processes are deliberately ignored.
  */
 export async function stopSafeVenvBlockers(
   updateRoot: string,
@@ -112,15 +134,17 @@ export async function stopSafeVenvBlockers(
   const failed: number[] = []
   const pythonPath = resolvePython(updateRoot)
 
+  const isStoppableKind = (kind: VenvBlockerKind) => kind === 'local-preview' || kind === 'fleet-worker'
+
   for (const process of result.processes) {
     if (
       !pythonPath ||
       !process.safeToStop ||
-      process.kind !== 'local-preview' ||
+      !isStoppableKind(process.kind) ||
       !process.createTime ||
       !Number.isFinite(process.createTime)
     ) {
-      if (process.safeToStop && process.kind === 'local-preview') {
+      if (process.safeToStop && isStoppableKind(process.kind)) {
         failed.push(process.pid)
       }
 

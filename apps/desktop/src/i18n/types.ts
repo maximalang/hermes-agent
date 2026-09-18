@@ -2876,6 +2876,7 @@ export interface Translations {
     closePreviewsAndUpdate: string
     closePreviewsAndCheckAgain: string
     localPreview: string
+    fleetWorker: string
     portLabel: (port: number) => string
     pidLabel: (pid: number) => string
     technicalDetails: string

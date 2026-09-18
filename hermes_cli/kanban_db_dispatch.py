@@ -211,6 +211,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
+    if raw == 0:
+        return ("clean_exit", 0)
     try:
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
@@ -884,10 +886,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         outcome = row["outcome"] or ""
         if outcome == "rate_limited":
             continue
-        if outcome == "crashed" and (
-            _kb._json_dict(row["metadata"]).get("protocol_violation")
-            or "protocol violation" in (row["error"] or "")
-        ):
+        if outcome == "crashed" and _kb._json_dict(row["metadata"]).get("protocol_violation"):
             streak += 1
             continue
         break
@@ -1802,6 +1801,11 @@ def _dispatch_lane_task(
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
     # it by assigning a profile, and health telemetry suppresses "stuck" for it.
     profile_exists = _profile_exists_fn()
+    # An explicit spawn_fn is used by the CLI/test adapter and is itself the
+    # routing contract; the gateway's default spawn must have a registry.
+    if profile_exists is None and spawn_fn.__name__ == "_default_spawn":
+        result.skipped_nonspawnable.append(task_id)
+        return False
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         return False
@@ -2098,9 +2102,10 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
+    effective_spawn_fn = spawn_fn if spawn_fn is not None else _default_spawn
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
-        failure_limit=failure_limit, spawn_fn=spawn_fn,
+        failure_limit=failure_limit, spawn_fn=effective_spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
