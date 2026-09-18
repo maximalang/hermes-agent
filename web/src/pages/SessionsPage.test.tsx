@@ -119,7 +119,11 @@ afterEach(async () => {
 });
 
 describe("SessionsPage per-row profile routing (#99387)", () => {
-  it("sends every per-row request to the row's owning profile, not the management default", async () => {
+  // The suite renders the full page through five providers and drives four
+  // sequential act/waitFor round-trips; on a loaded 4-vCPU CI runner that
+  // legitimately crosses vitest's 5s default. Local timeout keeps the
+  // assertions untouched — only the wall-clock budget grows.
+  it("sends every per-row request to the row's owning profile, not the management default", { timeout: 20000 }, async () => {
     await renderSessionsPage([
       { id: "sid-guanli", profile: "guanli", source: "cli", model: null, title: "Managed", started_at: 1, ended_at: null,
         last_active: 1, is_active: false, message_count: 2, tool_call_count: 0, input_tokens: 1, output_tokens: 1, preview: "hi" },
