@@ -1120,6 +1120,23 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def select_independent_reviewer(
+    current_profile: Optional[str], configured: Optional[str] = None,
+) -> Optional[str]:
+    """Choose one canonical reviewer distinct from the current profile.
+
+    Selection is deliberately lifecycle-only: callers resolve configuration and
+    validate installed profiles at their own surface. Keeping the ordering here
+    prevents CLI and worker tools from inventing separate review fallbacks.
+    """
+    current = _canonical_assignee(current_profile)
+    for candidate in (configured, "company", "qa"):
+        selected = _canonical_assignee(candidate)
+        if selected and selected != current:
+            return selected
+    return None
+
+
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
     workspace_kind: str, workspace_path: Optional[str],

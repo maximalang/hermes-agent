@@ -1,30 +1,20 @@
-"""Failing-first regression tests: judge transport failures must not deadlock a
-goal-mode card (kanban_complete / kanban_request_review).
+"""Goal-judge transport failures degrade to the canonical review lane.
 
-Root cause contract: ``judge_goal`` fails open to ``("continue", ..., transport_failed=True)``
-when the judge LLM is unreachable (PermissionDenied/403, auth, DNS). Every handoff gate
-mirrors that 5-tuple out of ``judge_goal``; when ``transport_failed`` is True the verdict
-is synthetic — NOT evidence that the work is incomplete. The gate must:
+``judge_goal`` fails open to ``("continue", ..., transport_failed=True)`` when
+the auxiliary judge is unreachable. That synthetic verdict must never reject a
+finished worker handoff, but it must not mark the task done either. Completion
+degrades atomically to the existing review phase, assigned to an independent
+profile; no verification child task or second lifecycle is created.
 
-1. ``tools.kanban_tools._goal_gate`` — allow the handoff (fail open, logged).
-2. ``tools.kanban_tools._goal_verdict_and_reason`` — return
-   ``(None, "goal judge transport failure: <exc-type>")`` so handlers render the
-   failure honestly (fail-open) without claiming a judge rejection.
-3. Spawn an independent verification child task (assignment to the human operator,
-   NOT auto-assigned to the worker) so a broken judge cannot trap a completed
-   parent — it degrades to a human-verified handoff.
-
-No model/pool changes.
+No model or pool changes.
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
-
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +48,8 @@ def test_goal_verdict_passes_through_real_judge_verdicts():
 # ---------------------------------------------------------------------------
 
 
-def test_complete_transport_failure_fails_open(monkeypatch, tmp_path):
-    """Judge PermissionDenied must NOT reject kanban_complete of a finished goal card."""
+def test_complete_transport_failure_routes_to_review(monkeypatch, tmp_path):
+    """Judge transport failure routes completion to the existing review phase."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
@@ -79,31 +69,41 @@ def test_complete_transport_failure_fails_open(monkeypatch, tmp_path):
             conn, title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        assert claimed is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
-    # Judge is reachable but its transport fails (the PermissionDenied shape).
     monkeypatch.setattr(kt, "_goal_judge_available", lambda: True)
     monkeypatch.setattr(
         kt, "judge_goal",
         lambda **kw: ("continue", "judge error: PermissionDenied", False, None, True))
+    monkeypatch.setattr(kt, "_goal_fallback_reviewer", lambda: "company")
 
-    # Child creation must be attempted (independent verification), not a hard reject.
-    created = {}
-    monkeypatch.setattr(kt, "_spawn_goal_verification_child",
-                        lambda conn, tid, reason: created.update(tid=tid, reason=reason) or "t_child")
+    out = kt._handle_complete({
+        "summary": "All acceptance criteria verified with evidence.",
+        "metadata": {"evidence_refs": ["artifact:report"]},
+    })
+    payload = json.loads(out)
 
-    out = kt._handle_complete({"summary": "All acceptance criteria verified with evidence."})
-    d = json.loads(out)
-
-    assert "error" not in d, f"transport failure must fail open, got: {d}"
-    assert created.get("tid") == goal_task_id
-    assert "PermissionDenied" in (created.get("reason") or "")
+    assert "error" not in payload, payload
+    assert payload["status"] == "review"
     conn2 = kbc.connect()
     try:
-        assert kb.get_task(conn2, goal_task_id).status == "done"
+        task = kb.get_task(conn2, goal_task_id)
+        assert task.status == "review"
+        assert task.assignee == "company"
+        assert kb.child_ids(conn2, goal_task_id) == []
+        run = kb.latest_run(conn2, goal_task_id)
+        assert run.outcome == "review_requested"
+        assert run.metadata["goal_judge"]["status"] == "transport_failed"
+        assert "PermissionDenied" in run.metadata["goal_judge"]["reason"]
+        assert run.metadata["receipt"]["status"] == "review_requested"
+        events = kb.list_events(conn2, goal_task_id)
+        assert events[-1].kind == "review_requested"
+        assert events[-1].run_id == run.id
     finally:
         conn2.close()
 
@@ -147,38 +147,28 @@ def test_complete_real_judge_rejection_still_rejects(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Unit: verification-child spawning
+# Canonical review fallback
 # ---------------------------------------------------------------------------
 
 
-def test_verification_child_skips_worker_self_assignment(monkeypatch):
-    """The verification child must go to a human operator, never the worker's own profile."""
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_db_connect as kbc
+def test_fallback_reviewer_skips_worker_self_assignment(monkeypatch):
     from tools import kanban_tools as kt
 
-    conn = MagicMock()
-    conn.execute.return_value = MagicMock(__getitem__=lambda *_: None)
-    monkeypatch.setattr(kb, "create_task", MagicMock(return_value="t_verify"))
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
-
-    tid = kt._spawn_goal_verification_child(conn, "t_parent", "judge error: PermissionDenied")
-
-    assert tid == "t_verify"
-    kwargs = kb.create_task.call_args.kwargs
-    assert kwargs.get("assignee") == "company"
-    assert kwargs.get("assignee") != "test-worker"
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.setattr(kt, "load_config", lambda: {})
+    assert kt._goal_fallback_reviewer() == "company"
+    assert kt._goal_fallback_reviewer() != "test-worker"
 
 
-def test_verification_assignee_falls_back_to_qa_for_company_worker(monkeypatch):
+def test_fallback_reviewer_uses_qa_for_company_worker(monkeypatch):
     from tools import kanban_tools as kt
 
     monkeypatch.setenv("HERMES_PROFILE", "company")
     monkeypatch.setattr(kt, "load_config", lambda: {})
-    assert kt._goal_verification_assignee() == "qa"
+    assert kt._goal_fallback_reviewer() == "qa"
 
 
-def test_request_review_transport_failure_does_not_spawn_redundant_child(monkeypatch):
+def test_request_review_transport_failure_needs_no_second_lane(monkeypatch):
     from tools import kanban_tools as kt
 
     task = type("Task", (), {"goal_mode": True, "title": "x", "body": "y"})()
@@ -188,84 +178,11 @@ def test_request_review_transport_failure_does_not_spawn_redundant_child(monkeyp
         "judge_goal",
         lambda **kw: ("continue", "judge error: PermissionDenied", False, None, True),
     )
-    spawned = []
-    monkeypatch.setattr(
-        kt,
-        "_spawn_goal_verification_child",
-        lambda *args: spawned.append(args) or "t_child",
-    )
 
-    kt._goal_gate("kanban_request_review", task, "t_parent", "evidence", conn=MagicMock())
+    fallback = kt._goal_gate(
+        "kanban_request_review", task, "t_parent", "evidence", conn=MagicMock())
 
-    assert spawned == []
-
-
-def test_verification_child_persists_parent_link(tmp_path, monkeypatch):
-    """Child creation uses the real DB and links the child back to the parent."""
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_db_connect as kbc
-    from tools import kanban_tools as kt
-
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-
-    kb._INITIALIZED_PATHS.clear()
-    kb.init_db()
-    conn = kbc.connect()
-    try:
-        parent_id = kb.create_task(conn, title="goal-parent", assignee="test-worker",
-                                   goal_mode=True)
-        child_id = kt._spawn_goal_verification_child(conn, parent_id, "judge error: X")
-        child = kb.get_task(conn, child_id)
-        assert child is not None, "verification child must exist"
-        # Task has no `parents` field; the link lives in task_links — assert it there.
-        assert kb.parent_ids(conn, child_id) == [parent_id]
-        assert child_id in kb.child_ids(conn, parent_id)
-        assert "judge error: X" in (child.body or "")
-        assert child.status in ("todo", "ready")
-    finally:
-        conn.close()
-
-
-def test_verification_child_persists_parent_link_devtest():
-    """Direct (non-monkeypatch) variant against a real tmp DB — same assertions as above."""
-    import tempfile
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_db_connect as kbc
-    from tools import kanban_tools as kt
-
-    old_home = __import__("os").environ.get("HERMES_HOME")
-    old_task = __import__("os").environ.get("HERMES_KANBAN_TASK")
-    tmp = Path(tempfile.mkdtemp(prefix="goal-judge-devtest-"))
-    try:
-        (tmp / ".hermes").mkdir()
-        __import__("os").environ["HERMES_HOME"] = str(tmp / ".hermes")
-        __import__("os").environ.pop("HERMES_KANBAN_TASK", None)
-        kb._INITIALIZED_PATHS.clear()
-        kb.init_db()
-        conn = kbc.connect()
-        try:
-            parent_id = kb.create_task(conn, title="goal-parent", assignee="test-worker",
-                                       goal_mode=True)
-            child_id = kt._spawn_goal_verification_child(conn, parent_id, "judge error: X")
-            child = kb.get_task(conn, child_id)
-            assert child is not None
-            assert "judge error: X" in (child.body or "")
-            assert child.status in ("todo", "ready")
-        finally:
-            conn.close()
-    finally:
-        if old_home is not None:
-            __import__("os").environ["HERMES_HOME"] = old_home
-        else:
-            __import__("os").environ.pop("HERMES_HOME", None)
-        if old_task is not None:
-            __import__("os").environ["HERMES_KANBAN_TASK"] = old_task
-        else:
-            __import__("os").environ.pop("HERMES_KANBAN_TASK", None)
+    assert "PermissionDenied" in fallback
 
 
 # ---------------------------------------------------------------------------
@@ -281,9 +198,8 @@ def _fake_goal_task():
     return task
 
 
-def test_cli_mirror_transport_failure_fails_open(monkeypatch):
-    """The CLI gate mirror must treat transport_failed=True as fail-open (done),
-    never as a judge rejection."""
+def test_cli_mirror_transport_failure_routes_to_review(monkeypatch):
+    """The CLI mirror exposes transport failure as a review fallback."""
     from hermes_cli import kanban as kcli
 
     monkeypatch.setattr(
@@ -294,8 +210,54 @@ def test_cli_mirror_transport_failure_fails_open(monkeypatch):
         lambda **kw: ("continue", "judge error: PermissionDenied", False, None, True))
 
     verdict, rejection = kcli._goal_mode_handoff_rejection(_fake_goal_task(), "all done")
-    assert verdict == "done", f"transport failure must fail open, got {verdict!r}"
-    assert rejection is None
+    assert verdict == "review"
+    assert "PermissionDenied" in rejection
+
+
+def test_cli_complete_transport_failure_routes_original_task_to_review(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban as kcli
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="cli goal", assignee="test-worker",
+            body="Verify the outcome.", goal_mode=True)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda purpose: (MagicMock(), "judge-model"))
+    monkeypatch.setattr(
+        "hermes_cli.goals.judge_goal",
+        lambda **kw: ("continue", "judge error: PermissionDenied", False, None, True))
+    monkeypatch.setattr(kcli, "_goal_fallback_reviewer", lambda: "company")
+
+    rc = kcli._cmd_complete(SimpleNamespace(
+        task_ids=[tid], summary="verified handoff", result=None,
+        metadata='{"evidence_refs":["artifact:cli"]}', force=False))
+
+    assert rc == 0
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "review"
+        assert task.assignee == "company"
+        assert kb.child_ids(conn, tid) == []
+        run = kb.latest_run(conn, tid)
+        assert run.outcome == "review_requested"
+        assert run.metadata["goal_judge"]["status"] == "transport_failed"
+        assert run.metadata["receipt"]["status"] == "review_requested"
 
 
 def test_cli_mirror_real_rejection_still_rejects(monkeypatch):

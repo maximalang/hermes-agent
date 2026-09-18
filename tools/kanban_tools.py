@@ -495,13 +495,14 @@ def _goal_verdict_and_reason(judge_fn, *, goal: str = "", last_response: str = "
     return verdict, reason
 
 
-def _goal_verification_assignee() -> Optional[str]:
-    """Choose an independent profile for transport-fallback verification.
+def _goal_fallback_reviewer() -> Optional[str]:
+    """Choose an independent profile for the canonical review fallback.
 
-    Honour ``kanban.goal_verification_assignee`` when it is not the current
-    worker. Otherwise prefer ``company`` and fall back to ``qa`` when company
-    itself produced the handoff. This keeps the child dispatchable without
-    allowing self-verification or requiring a model/pool configuration change.
+    Honour the existing ``kanban.goal_verification_assignee`` setting for
+    backwards compatibility, but route the original task through its normal
+    review phase instead of creating a special verification child. Otherwise
+    prefer ``company`` and fall back to ``qa`` when company produced the
+    handoff, so a worker never reviews its own completion.
     """
     worker = (os.environ.get("HERMES_PROFILE") or "").strip()
     try:
@@ -509,80 +510,41 @@ def _goal_verification_assignee() -> Optional[str]:
     except Exception:
         name = None
     configured = name.strip() if isinstance(name, str) and name.strip() else None
-    if configured and configured != worker:
-        return configured
-    for candidate in ("company", "qa"):
-        if candidate != worker:
-            return candidate
-    return None
-
-
-def _spawn_goal_verification_child(conn, parent_tid: str, reason: str) -> Optional[str]:
-    """Independent verification child for a goal-mode handoff the judge could not
-    evaluate (transport failure). The parent was allowed to hand off fail-open; this
-    card makes that visible and reviewable instead of silently waved through.
-    ``idempotency_key`` keeps a retried handoff from stacking duplicates.
-    Best-effort: returns the child id, or None (logged) if creation failed."""
     from hermes_cli import kanban_db as kb
-    try:
-        child_id = kb.create_task(
-            conn,
-            title=f"Verify goal-mode handoff of {parent_tid} (judge transport failure)",
-            body=(
-                "task_type: review\n"
-                f"Independent verification of {parent_tid}: the goal-mode judge could not "
-                f"evaluate the worker's handoff because its transport failed, so the handoff "
-                "was allowed fail-open. Review the parent's acceptance evidence before "
-                "treating it as done.\n\n"
-                f"Judge failure reason: {reason}"),
-            assignee=_goal_verification_assignee(),
-            created_by=os.environ.get("HERMES_PROFILE") or "worker",
-            parents=(parent_tid,),
-            idempotency_key=f"goal-verify:{parent_tid}",
-        )
-        return child_id
-    except Exception:
-        logger.warning("goal judge transport failure: could not spawn verification child "
-                       "for %s", parent_tid, exc_info=True)
-        return None
+
+    return kb.select_independent_reviewer(worker, configured)
 
 
-def _goal_gate(tool_name: str, task, tid: str, evidence: str, conn=None) -> None:
-    """Goal-mode pre-handoff judge gate: a worker must not complete / request
-    review before acceptance criteria are met. ``blocked`` gets its own
-    guidance; any other non-``done`` verdict gets the ``continue`` guidance.
-    A broken judge fails open (logged) so it cannot permanently wedge work —
-    including a judge whose transport fails: its synthetic ``continue`` is not
-    a rejection, so the handoff is allowed and an independent verification
-    child is spawned for a human instead."""
+def _goal_gate(tool_name: str, task, tid: str, evidence: str, conn=None) -> Optional[str]:
+    """Run the goal-mode handoff judge.
+
+    ``None`` means the requested transition may proceed. A non-empty return
+    value means the judge transport failed: callers must preserve that reason
+    and use their canonical fallback. Completion routes the original task to
+    review; a review request is already in that lane and simply proceeds.
+    Reachable non-``done`` verdicts still reject the handoff.
+    """
     if not task or not task.goal_mode or not _goal_judge_available():
-        return
+        return None
     try:
         verdict, reason = _goal_verdict_and_reason(
             judge_goal,
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip())
     except Exception as judge_exc:
+        reason = _redact(
+            f"goal judge check failed: {type(judge_exc).__name__}: {judge_exc}")
         logger.warning(
-            "goal judge check failed, allowing lifecycle handoff: %s", judge_exc, exc_info=True)
-        return
+            "goal judge check failed on %s of %s; routing through canonical fallback: %s",
+            tool_name, tid, reason, exc_info=True)
+        return reason
     if verdict is None:
-        # Transport failure: fail open, but leave an auditable verification child.
-        logger.warning("goal judge transport failure on %s of %s (%s); allowing handoff "
-                       "fail-open", tool_name, tid, reason)
-        if tool_name == "kanban_complete":
-            if conn is not None:
-                _spawn_goal_verification_child(conn, tid, reason)
-            else:
-                try:
-                    with _board(None, quiet_close=True) as (_kb, own_conn):
-                        _spawn_goal_verification_child(own_conn, tid, reason)
-                except Exception:
-                    logger.debug("goal judge transport failure: board open for verification "
-                                 "child failed", exc_info=True)
-        return
+        logger.warning(
+            "goal judge transport failure on %s of %s (%s); routing through canonical fallback",
+            tool_name, tid, reason)
+        return reason
     if verdict == "done":
-        return
+        return None
     key = "blocked" if verdict == "blocked" else "continue"
     raise _Reject(_GOAL_GATE_MESSAGES[tool_name][key].format(reason=reason, tid=tid))
 
@@ -788,7 +750,37 @@ def _handle_complete(args: dict, **kw) -> str:
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
-        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip(), conn=conn)
+        fallback_reason = _goal_gate(
+            "kanban_complete", task, tid, (summary or result or "").strip(), conn=conn)
+        if fallback_reason:
+            # The judge transport is advisory infrastructure, not completion
+            # evidence. Keep the original card and use its first-class review
+            # phase; do not mark it done or create a parallel verification task.
+            review_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            review_metadata["goal_judge"] = {
+                "status": "transport_failed",
+                "reason": fallback_reason,
+                "requested_transition": "complete",
+            }
+            if created_cards:
+                review_metadata["requested_completion"] = {
+                    "created_cards": list(created_cards),
+                }
+            try:
+                ok, fail_reason = kb.request_review(
+                    conn, tid, summary=summary or result, metadata=review_metadata,
+                    reviewer=_goal_fallback_reviewer(),
+                    expected_run_id=_worker_run_id(tid), with_reason=True)
+            except kb.ArtifactPreservationError as artifact_err:
+                return tool_error(
+                    f"kanban_complete could not preserve the declared artifacts while routing "
+                    f"the judge transport failure to review: {artifact_err}. Your task is still "
+                    f"in-flight and its scratch workspace was kept. Fix the artifact path or "
+                    f"storage error, then retry kanban_complete with the same handoff.")
+            _check(ok, f"could not route {tid} to review after goal judge transport failure: "
+                       f"{fail_reason or 'unknown id or not in running/ready'}")
+            return _ok_landed(
+                kb, conn, tid, "review", fallback="goal_judge_transport_failure")
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
@@ -905,7 +897,15 @@ def _handle_request_review(args: dict, **kw) -> str:
                f"reviewer profile {reviewer!r} is not installed. "
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
-        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary, conn=conn)
+        fallback_reason = _goal_gate(
+            "kanban_request_review", kb.get_task(conn, tid), tid, summary, conn=conn)
+        if fallback_reason:
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            metadata["goal_judge"] = {
+                "status": "transport_failed",
+                "reason": fallback_reason,
+                "requested_transition": "review",
+            }
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
