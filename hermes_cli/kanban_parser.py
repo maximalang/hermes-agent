@@ -299,8 +299,10 @@ _SPECS = [
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
-                  "parents finish, no human); 'needs_input'/'capability' go to "
-                  "blocked for a human; 'transient' marks a maybe-flaky failure. "
+                  "parents finish, no human); 'needs_input'/'capability'/'policy_denied' "
+                  "go to blocked for a human ('policy_denied' = Fleet Policy refuse with "
+                  "a remediation route; not a crash, retry only after the denied "
+                  "precondition changes); 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
     ], help="Mark one or more tasks blocked"),

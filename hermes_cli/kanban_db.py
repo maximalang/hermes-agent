@@ -104,7 +104,7 @@ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "policy_denied"}
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
@@ -1977,16 +1977,23 @@ def _with_terminal_receipt(
     if isinstance(existing, dict):
         return value
     terminal = {"completed": "done", "reclaimed": "timed_out", "crashed": "crashed",
-                "protocol_violation": "protocol_violation"}.get(outcome, outcome)
+                "protocol_violation": "protocol_violation",
+                "policy_denied": "policy_denied"}.get(outcome, outcome)
     refs = value.get("evidence_refs") or value.get("artifact_refs") or []
     if not isinstance(refs, list):
         refs = [str(refs)]
     if error and not refs:
         refs = [f"error:{str(error)[:240]}"]
+    next_action = "verify outcome"
+    if terminal == "policy_denied":
+        next_action = ("apply remediation route in the block reason; "
+                       "retry only after the denied precondition changes")
+    elif terminal != "done":
+        next_action = "review outcome and continue workflow"
     value["receipt"] = {
         "status": terminal,
         "evidence_refs": refs,
-        "next_action": "review outcome and continue workflow" if terminal != "done" else "verify outcome",
+        "next_action": next_action,
     }
     return value
 
@@ -3215,7 +3222,9 @@ def block_task(
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
+            conn, task_id,
+            outcome="policy_denied" if kind == "policy_denied" else "blocked",
+            status="blocked", summary=reason, synthesize=bool(reason),
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
