@@ -4166,6 +4166,97 @@ def _counts_by_assignee(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
     return counts
 
 
+# --- Lifecycle outcome metrics (read-only over task_runs / tasks) ------------
+
+def lifecycle_metrics(conn: sqlite3.Connection, *, window_days: int = 28) -> dict:
+    """Closed-run outcome metrics for the auto-company control plane.
+
+    Pure read-only aggregation over the existing ledger — no new tables, no
+    writes. Every value is derived from durable ``task_runs`` rows so a
+    metric can never claim success the ledger does not hold:
+
+    * ``receipt_coverage_pct`` — closed runs carrying the automatic terminal
+      receipt (``metadata.receipt``), the machine-readable handoff contract;
+    * ``protocol_violation_pct`` — clean-exit runs without a terminal call
+      (rc=0 while still running);
+    * ``policy_denied_pct`` — runs terminated by a Fleet Policy deny (typed
+      disposition, never counted as crash);
+    * ``median_claim_to_done_seconds`` — median duration of ``completed`` runs;
+    * ``retry_rate_pct`` — share of tasks whose completed state took more than
+      one run (bounded retries visible, not hidden);
+    * ``stuck_tasks`` — non-terminal tasks older than ``window_days``;
+    * ``token_cost_per_accepted_outcome`` — ``None`` with an explicit reason:
+      token usage is not persisted on ``task_runs`` in this schema. Unknown is
+      reported as null, never as 0.
+    """
+    cutoff = int(time.time()) - window_days * 86400
+    rows = conn.execute(
+        "SELECT task_id, outcome, metadata, started_at, ended_at FROM task_runs "
+        "WHERE ended_at IS NOT NULL AND ended_at >= ?", (cutoff,),
+    ).fetchall()
+    closed = len(rows)
+    with_receipt = 0
+    violations = 0
+    denied = 0
+    completed_durations: list[int] = []
+    for row in rows:
+        meta = _json_dict(_row_get(row, "metadata"))
+        if isinstance(meta.get("receipt"), dict):
+            with_receipt += 1
+        outcome = row["outcome"] or ""
+        if outcome == "protocol_violation" or (
+            outcome == "crashed" and meta.get("protocol_violation")
+        ):
+            violations += 1
+        if outcome == "policy_denied":
+            denied += 1
+        if outcome == "completed":
+            started = _to_epoch(_row_get(row, "started_at"))
+            ended = _to_epoch(row["ended_at"])
+            if started is not None and ended is not None and ended >= started:
+                completed_durations.append(ended - started)
+
+    median_done: Optional[int] = None
+    if completed_durations:
+        ordered = sorted(completed_durations)
+        mid = len(ordered) // 2
+        median_done = (
+            ordered[mid] if len(ordered) % 2
+            else (ordered[mid - 1] + ordered[mid]) // 2
+        )
+
+    run_counts = conn.execute(
+        "SELECT task_id, COUNT(*) AS n, "
+        "MAX(CASE WHEN outcome = 'completed' THEN 1 ELSE 0 END) AS done "
+        "FROM task_runs WHERE ended_at >= ? GROUP BY task_id", (cutoff,),
+    ).fetchall()
+    done_tasks = [int(r["n"]) for r in run_counts if int(r["done"])]
+    retried = sum(1 for n in done_tasks if n > 1)
+
+    stuck_row = conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks "
+        "WHERE status IN ('todo', 'ready', 'blocked', 'triage', 'review') "
+        "AND created_at < ?", (cutoff,),
+    ).fetchone()
+
+    pct = lambda n: (round(100.0 * n / closed, 2) if closed else None)  # noqa: E731
+    return {
+        "window_days": window_days,
+        "closed_runs": closed,
+        "receipt_coverage_pct": pct(with_receipt),
+        "protocol_violation_pct": pct(violations),
+        "policy_denied_pct": pct(denied),
+        "median_claim_to_done_seconds": median_done,
+        "completed_tasks": len(done_tasks),
+        "retry_rate_pct": (
+            round(100.0 * retried / len(done_tasks), 2) if done_tasks else None
+        ),
+        "stuck_tasks": int(stuck_row["n"]) if stuck_row else 0,
+        "token_cost_per_accepted_outcome": None,
+        "token_cost_note": "token usage is not persisted on task_runs",
+    }
+
+
 def _to_epoch(val) -> Optional[int]:
     """Epoch seconds from int/float/numeric string/ISO-8601; None for empty/invalid."""
     if val is None:

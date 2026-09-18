@@ -1180,6 +1180,28 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_metrics(args: argparse.Namespace) -> int:
+    """Read-only lifecycle outcome metrics over the run ledger."""
+    window = int(getattr(args, "window_days", None) or 28)
+    with kbc.connect_closing() as conn:
+        metrics = kb.lifecycle_metrics(conn, window_days=window)
+    if _json_out(args, metrics):
+        return 0
+    def _fmt(v):
+        return "n/a" if v is None else v
+    print(f"Window: last {metrics['window_days']}d · closed runs: {metrics['closed_runs']}")
+    print(f"  receipt coverage:      {_fmt(metrics['receipt_coverage_pct'])}%")
+    print(f"  protocol violations:   {_fmt(metrics['protocol_violation_pct'])}%")
+    print(f"  policy denied:         {_fmt(metrics['policy_denied_pct'])}%")
+    print(f"  median claim->done:    {_fmt(metrics['median_claim_to_done_seconds'])}s")
+    print(f"  completed tasks:       {metrics['completed_tasks']}")
+    print(f"  retry rate:            {_fmt(metrics['retry_rate_pct'])}%")
+    print(f"  stuck tasks:           {metrics['stuck_tasks']}")
+    print(f"  token cost/outcome:    {_fmt(metrics['token_cost_per_accepted_outcome'])} "
+          f"({metrics['token_cost_note']})")
+    return 0
+
+
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     delivery_metadata = {
         key: value
@@ -1360,6 +1382,7 @@ _HANDLERS = {
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
+    "metrics": _cmd_metrics,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
