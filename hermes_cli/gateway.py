@@ -4912,6 +4912,21 @@ def _respawn_storm_backoff() -> None:
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard."""
+    # The gateway is the Kanban dispatcher OWNER, never a delegate_task child.
+    # An inherited HERMES_DELEGATED_CHILD_CONTEXT (restart launched from inside a
+    # delegate child) fences the whole kanban root and turns every dispatcher
+    # tick into a PermissionError — a silent fleet-wide dispatch outage. Drop it
+    # BEFORE any kanban code runs (#t_baed78d9 incident 2026-09-18).
+    from agent.delegation_context import clear_inherited_delegate_fence
+
+    _inherited_fence = clear_inherited_delegate_fence()
+    if _inherited_fence:
+        logger.warning(
+            "gateway: cleared inherited %s=%r from the launch environment — the "
+            "gateway is the kanban dispatcher owner and must never run under a "
+            "delegate-child fence.",
+            "HERMES_DELEGATED_CHILD_CONTEXT", _inherited_fence,
+        )
     _guard_official_docker_root_gateway()
     _guard_named_profile_under_multiplexer(force=force)
     _guard_supervised_gateway_conflict(force=force)
