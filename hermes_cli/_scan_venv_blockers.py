@@ -116,6 +116,75 @@ def _local_preview_metadata(pid: int, name: str) -> dict[str, object]:
         return {}
 
 
+def _classify_fleet_worker_args(args: object) -> dict[str, object]:
+    """Safe-stop metadata for fleet CLI workers / execute_code kernels; ``{}`` otherwise.
+
+    Owner-approved (2026-09-18): the Desktop updater may stop fleet processes holding the venv
+    during a day-time update. The kanban dispatcher reconciles orphaned running tasks
+    (``reconcile_orphans=True``) and requeues them, so stopping a worker is recoverable.
+    Same argv-trust contract as :func:`_classify_local_preview_args`: only an EXACT argv read
+    via psutil (never the truncated display cmdline) may authorize termination.
+    """
+    if not isinstance(args, (list, tuple)) or not all(isinstance(arg, str) for arg in args):
+        return {}
+    joined = " ".join(args)
+    metadata: dict[str, object] = {}
+    is_cli_main = " -m hermes_cli.main " in f" {joined} " or any(
+        arg == "hermes_cli.main" for arg in args
+    )
+    if is_cli_main and "--cli" in args:
+        # Dispatcher-spawned headless worker (`hermes -p <profile> --cli ...`).
+        # `--cli` is required so an interactive TUI/REPL the user is typing
+        # into stays a foreign blocker (upstream contract: user closes it).
+        # Gateway/serve/dashboard argvs are owned by the updater's own rungs
+        # (socket pause + ledger relaunch) — never classify them here
+        # (defense in depth; main() exempts them before classification).
+        _UPDATER_OWNED_SUBCOMMANDS = ("gateway", "serve", "dashboard")
+        if any(arg in _UPDATER_OWNED_SUBCOMMANDS for arg in args):
+            return {}
+        metadata = {"kind": "fleet-worker", "safeToStop": True}
+        # Best-effort profile label for the UI. Never authorizes termination.
+        for i, arg in enumerate(args):
+            if arg in ("-p", "--profile") and i + 1 < len(args):
+                candidate = args[i + 1].strip()
+                if candidate and not candidate.startswith("-"):
+                    metadata["label"] = candidate[:40]
+                break
+    elif any("site.addsitedir" in arg for arg in args) and any(
+        "hermes-agent" in arg for arg in args
+    ):
+        # execute_code session kernel (spawned via a -c bootstrap that injects the
+        # venv site-packages). Ephemeral by design; a fresh kernel is spawned on
+        # the next execute_code call.
+        metadata = {"kind": "fleet-worker", "safeToStop": True, "label": "kernel"}
+    if metadata:
+        return metadata
+    return {}
+
+
+def _safe_blocker_metadata(pid: int, name: str) -> dict[str, object]:
+    """Combined safe-stop classification: local preview first, then fleet worker."""
+    metadata = _local_preview_metadata(pid, name)
+    if metadata:
+        return metadata
+    return _classify_fleet_worker_metadata(pid, name)
+
+
+def _classify_fleet_worker_metadata(pid: int, name: str) -> dict[str, object]:
+    if name.lower() not in _PYTHON_PROCESS_NAMES:
+        return {}
+    try:
+        import psutil  # noqa: PLC0415
+
+        process = psutil.Process(pid)
+        metadata = _classify_fleet_worker_args(process.cmdline())
+        if metadata:
+            metadata["createTime"] = process.create_time()
+        return metadata
+    except Exception:
+        return {}
+
+
 def _terminate_safe_preview(
     pid: int, expected_create_time: float, *, psutil_module: object | None = None,
 ) -> tuple[bool, str | None]:
@@ -132,8 +201,10 @@ def _terminate_safe_preview(
         process = psutil_module.Process(pid)  # type: ignore[attr-defined]
         if abs(process.create_time() - expected_create_time) > 0.001:
             return False, "process identity changed"
-        if not _classify_local_preview_args(process.cmdline()):
-            return False, "process is no longer a local preview"
+        if not _classify_local_preview_args(process.cmdline()) and not _classify_fleet_worker_args(
+            process.cmdline()
+        ):
+            return False, "process is no longer a safe-stoppable holder"
         targets = [*reversed(process.children(recursive=True)), process]
         for target in targets:
             target.terminate()
@@ -278,7 +349,7 @@ def main() -> None:
         # Truncate for display AFTER the gateway exemption has seen the full cmdline (long
         # managed-runtime interpreter paths would otherwise swallow the `gateway run` argv).
         process = {"pid": pid, "name": name, "cmdline": _redact_sensitive_cmdline(cmdline)[:120]}
-        process.update(_local_preview_metadata(pid, name))
+        process.update(_safe_blocker_metadata(pid, name))
         processes.append(process)
 
     # pausable_gateways / deferred_backends / deferred_backend_evidence are diagnostic only.
