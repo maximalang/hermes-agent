@@ -19,8 +19,12 @@ import sys
 import tempfile
 import time
 
-REPO = r"C:/Users/max/AppData/Local/Temp/autocompany-p0"
-PY = r"C:/Users/max/AppData/Local/hermes/hermes-agent/.venv/Scripts/python.exe"
+# REPO / PY are overridable so the nightly layer-apply task can verify the LIVE
+# checkout (argv1 = repo path, argv2 = venv python). Defaults target the branch
+# worktree for local dev runs. The canary only ever writes to a throwaway
+# HERMES_HOME, so pointing it at the live checkout is read-only w.r.t. real boards.
+REPO = sys.argv[1] if len(sys.argv) > 1 else r"C:/Users/max/AppData/Local/Temp/autocompany-p0"
+PY = sys.argv[2] if len(sys.argv) > 2 else r"C:/Users/max/AppData/Local/hermes/hermes-agent/.venv/Scripts/python.exe"
 HOME = tempfile.mkdtemp(prefix="e2e-canary-")
 FAILURES = []
 
