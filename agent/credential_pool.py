@@ -133,13 +133,12 @@ EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60
 # credential cools down briefly instead.
 EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS = 60
 
-# Owner directive 2026-09-05 (zai MAX key): Z.AI's 5-hour-window 429 (code 1308)
-# reset stamp is frequently premature — live probes and the monitor endpoint show
-# the MAX key serving 200 at ~12% window usage while the pool blind-benched it
-# for ~7h. Cap a zai 1308 bench at this many seconds so a stale stamp cannot
-# strand a working key; a genuine throttle then costs one failing probe per cap
-# window before re-trying. 1310 (Weekly/Monthly credit) stays unbounded (real).
-ZAI_REPROBE_CAP_SECONDS = 15 * 60
+# Transient 429 with no usable provider reset stamp (per-minute RPM throttles):
+# an hour-long bench strands a credential whose quota window is fine — the
+# throttle clears in seconds. Walk a streak-driven ladder instead; any success
+# resets the streak (_CLEAR_STATUS). The top rung keeps a persistently-throttled
+# key mostly out of rotation without a permanent bench.
+TRANSIENT_429_LADDER_SECONDS = (60, 300, 900)
 
 # ``FailoverReason.billing`` as a bare string: the pool persists classified
 # failure semantics to JSON and must not import the classifier.
@@ -198,6 +197,7 @@ _CLEAR_STATUS: Dict[str, Any] = {
     "last_error_reason": None,
     "last_error_message": None,
     "last_error_reset_at": None,
+    "consecutive_429": 0,
 }
 _MARK_OK: Dict[str, Any] = {**_CLEAR_STATUS, "last_status": STATUS_OK}
 
@@ -233,6 +233,10 @@ class PooledCredential:
     agent_key: Optional[str] = None
     agent_key_expires_at: Optional[str] = None
     request_count: int = 0
+    # Streak of back-to-back stamp-less transient 429s on this entry; drives the
+    # TRANSIENT_429_LADDER_SECONDS cooldown. Cleared with the rest of the error
+    # state on any success (_CLEAR_STATUS).
+    consecutive_429: int = 0
     # A provider may rate-limit one model while the same credential remains
     # usable for its sibling models.  Keep that observation separate from the
     # credential-wide status used for auth and billing failures.
@@ -362,6 +366,7 @@ def _exhausted_ttl(
     *,
     sole_credential: bool = False,
     failure_reason: Optional[str] = None,
+    consecutive_429: Optional[int] = None,
 ) -> int:
     """Return cooldown seconds based on the HTTP status that caused exhaustion.
 
@@ -375,6 +380,14 @@ def _exhausted_ttl(
     bench regardless of status; 402 is billing by definition.
     Unverified billing (#82154) gets the short cooldown regardless of pool
     size (the credential may be healthy), unless the status is a true 402.
+
+    *consecutive_429*: streak of back-to-back stamp-less 429s on this entry
+    (persisted field, cleared on any success). A 429 with no usable provider
+    reset stamp is a short-window throttle (per-minute RPM class): walk
+    TRANSIENT_429_LADDER_SECONDS instead of the flat hour so a credential whose
+    quota window is fine re-enters rotation in a minute, while a persistently
+    throttled one converges to the top rung. ``None`` (streak not tracked, e.g.
+    model-scoped cooldowns) keeps the historical flat TTL.
     """
     if error_code == 401:
         return EXHAUSTED_TTL_401_SECONDS
@@ -382,6 +395,9 @@ def _exhausted_ttl(
     if failure_reason == FAILURE_REASON_BILLING_UNVERIFIED and error_code != 402:
         return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
     is_billing = error_code == 402 or failure_reason == FAILURE_REASON_BILLING
+    if not is_billing and error_code == 429 and consecutive_429 is not None:
+        rung = min(max(int(consecutive_429) - 1, 0), len(TRANSIENT_429_LADDER_SECONDS) - 1)
+        base = TRANSIENT_429_LADDER_SECONDS[rung]
     if sole_credential and not is_billing:
         return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
     return base
@@ -457,32 +473,6 @@ def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) 
     if entry.last_status != STATUS_EXHAUSTED:
         return None
     reset_at = _parse_absolute_timestamp(entry.last_error_reset_at)
-    if entry.provider == "zai":
-        # Owner directive 2026-09-05, re-anchored 2026-09-09 onto upstream
-        # v0.21.1: the MAX-subscription key serves HTTP 200 while the pool
-        # blind-benches it for hours, because Z.AI 429 reset stamps are
-        # routinely premature — the monitor endpoint shows TOKENS_LIMIT ~12%
-        # and live probes return 200. Monitor is truth: never blind-bench zai
-        # on the provider stamp alone. Honour it ONLY for the genuine
-        # Weekly/Monthly credit exhaustion (1310), which is real and
-        # long-lived. For 1308 (5h rolling window) cap the bench at
-        # ZAI_REPROBE_CAP_SECONDS so a premature stamp cannot strand a working
-        # key for hours, while a genuine throttle costs at most one failing
-        # probe per cap window. Other zai 429s (1302 rate-limit, no usable
-        # stamp) re-probe at once only for a sole key. In a multi-key pool,
-        # bench the failed entry for the same bounded interval so selection
-        # can advance to the fallback instead of immediately re-leasing it.
-        # The old TZ-local text-stamp fix is moot on this upstream: absolute
-        # stamps are no longer parsed from message text, and naive ISO stamps
-        # parse as LOCAL time natively.
-        reason = (entry.last_error_reason or "").strip()
-        if reason == "1310" and reset_at is not None:
-            return reset_at
-        if reason == "1308" and reset_at is not None:
-            return min(reset_at, time.time() + ZAI_REPROBE_CAP_SECONDS)
-        if sole_credential:
-            return None
-        return (entry.last_status_at or time.time()) + ZAI_REPROBE_CAP_SECONDS
     if reset_at is not None:
         return reset_at
     if entry.last_status_at:
@@ -490,6 +480,7 @@ def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) 
             entry.last_error_code,
             sole_credential=sole_credential,
             failure_reason=entry.failure_reason,
+            consecutive_429=entry.consecutive_429,
         )
     return None
 
@@ -1008,6 +999,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             updated_extra["failure_reason"] = failure_reason
         else:
             updated_extra.pop("failure_reason", None)
+        # Streak of stamp-less transient 429s drives the ladder in _exhausted_ttl.
+        # A stamped reset or a billing verdict is not a short-window throttle, so
+        # the streak does not apply and resets.
+        transient_429 = (
+            status_code == 429
+            and failure_reason != FAILURE_REASON_BILLING
+            and normalized_error.get("reset_at") is None
+        )
         return self._adopt(
             entry,
             persist=persist,
@@ -1017,6 +1016,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
             last_error_reset_at=normalized_error.get("reset_at"),
+            consecutive_429=int(entry.consecutive_429 or 0) + 1 if transient_429 else 0,
             extra=updated_extra,
         )
 

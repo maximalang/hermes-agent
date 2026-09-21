@@ -148,15 +148,62 @@ def test_sole_credential_next_available_at_uses_short_cooldown(tmp_path, monkeyp
     )
 
 
-def test_multi_key_429_keeps_full_bench(tmp_path, monkeypatch):
-    """With more than one non-DEAD entry there IS something to rotate to, so the
-    short cooldown must not kick in — both recently-throttled keys stay benched."""
+def test_multi_key_429_walks_ladder_not_flat_hour(tmp_path, monkeypatch):
+    """Stamp-less 429s on a multi-key pool walk the transient ladder, not a flat hour.
+
+    Owner directive 2026-09-21: a 429 with no usable provider reset stamp is a
+    short-window throttle (RPM class). Benching every rotated key for a full
+    hour took pools with healthy quota offline (zai MAX key served 200 while
+    benched). The ladder (60s -> 5m -> 15m) re-enters rotation in a minute on
+    the first strike; the sole-credential 60s cap is no longer the only escape.
+    """
     pool = _load(
         tmp_path,
         monkeypatch,
         [
             _entry(429, age_seconds=90, cred_id="cred-1", priority=0),
             _entry(429, age_seconds=90, cred_id="cred-2", priority=1),
+        ],
+    )
+    # Streak defaults to 0 on disk: legacy rows behave like a first strike and
+    # get the 60s rung, so at age 90s both are already re-selectable.
+    assert pool.has_available() is True
+    entry = pool.select()
+    assert entry is not None
+    assert entry.last_status == "ok"
+
+    # Second strike (streak 2) benches 5m: at age 90s still benched.
+    pool2 = _load(
+        tmp_path,
+        monkeypatch,
+        [
+            dict(_entry(429, age_seconds=90, cred_id="cred-1", priority=0), consecutive_429=2),
+            dict(_entry(429, age_seconds=90, cred_id="cred-2", priority=1), consecutive_429=2),
+        ],
+    )
+    assert pool2.has_available() is False
+    assert pool2.select() is None
+
+
+def test_multi_key_429_top_rung_stays_benched(tmp_path, monkeypatch):
+    """A persistently throttled key converges to the 15m top rung and stays benched."""
+    entries = []
+    for cred_id, priority in (("cred-1", 0), ("cred-2", 1)):
+        e = dict(_entry(429, age_seconds=90, cred_id=cred_id, priority=priority), consecutive_429=5)
+        entries.append(e)
+    pool = _load(tmp_path, monkeypatch, entries)
+    assert pool.has_available() is False
+    assert pool.select() is None
+
+
+def test_multi_key_billing_429_keeps_full_bench(tmp_path, monkeypatch):
+    """A 429 classified as BILLING is real exhaustion: the ladder must not apply."""
+    pool = _load(
+        tmp_path,
+        monkeypatch,
+        [
+            dict(_entry(429, age_seconds=90, cred_id="cred-1", priority=0, failure_reason="billing"), consecutive_429=9),
+            dict(_entry(429, age_seconds=90, cred_id="cred-2", priority=1, failure_reason="billing"), consecutive_429=9),
         ],
     )
     assert pool.has_available() is False
