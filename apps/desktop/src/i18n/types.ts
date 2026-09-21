@@ -139,6 +139,7 @@ export interface Translations {
     connect: string
     connecting: string
     continue: string
+    bots: string
     copied: string
     copy: string
     copyFailed: string
@@ -183,6 +184,8 @@ export interface Translations {
     deleteTitle: (name: string) => string
     deleteBody: string
     pathCopied: string
+    revealMissing: string
+    revealUnavailable: string
   }
 
   boot: {
@@ -432,6 +435,7 @@ export interface Translations {
   }
 
   settings: {
+    subpages: Record<string, string>
     closeSettings: string
     exportConfig: string
     importConfig: string
@@ -618,6 +622,10 @@ export interface Translations {
       colorModeDesc: string
       toolViewTitle: string
       toolViewDesc: string
+      hideCodeDiffsTitle: string
+      hideCodeDiffsDesc: string
+      hideThreadTimelineTitle: string
+      hideThreadTimelineDesc: string
       reasoningCollapsedTitle: string
       reasoningCollapsedDesc: string
       uiScaleTitle: string
@@ -1582,6 +1590,10 @@ export interface Translations {
       updateToPin: (sha: string) => string
       updateFailed: (name: string) => string
       updated: (name: string) => string
+      deepLinkErrorTitle: string
+      deepLinkCatalogInvalidName: string
+      deepLinkCatalogUnknown: (name: string) => string
+      deepLinkCatalogUnavailable: string
     }
     officialCatalog: string
     officialPill: string
@@ -2176,21 +2188,18 @@ export interface Translations {
     failedRename: string
   }
 
+  modelAssignment: {
+    saveFailed: string
+    confirmTitle: string
+    confirmDetail: string
+    confirmAction: string
+    declined: string
+  }
+
   cron: {
     close: string
     title: string
     count: (count: number) => string
-    modelImpact: {
-      title: string
-      message: (count: number) => string
-      detailMore: (names: string, remaining: number) => string
-      review: string
-      saveFailed: string
-      confirmTitle: string
-      confirmDetail: string
-      confirmAction: string
-      declined: string
-    }
     search: string
     loading: string
     states: Record<string, string>
@@ -2362,6 +2371,10 @@ export interface Translations {
     results: string
     pinned: string
     sessions: string
+    terminal: string
+    files: string
+    review: string
+    logs: string
     cronJobs: string
     groupAriaGrouped: string
     groupAriaUngrouped: string
@@ -3139,6 +3152,8 @@ export interface Translations {
       xhigh: string
       max: string
       ultra: string
+      /** The CLI's `/reasoning` clamp note, e.g. "sends Max on this route". */
+      sendsOnRoute: (level: string) => string
       updateFailed: string
       fastFailed: string
     }
@@ -3548,6 +3563,12 @@ export interface Translations {
       /** Global toast title for a mid-turn gateway `error` event. */
       errorToastTitle: string
       errorRetry: string
+      errorLimitResets: (time: string) => string
+      /** Arms ONE client-side retry of this turn at the 429's `resets_at` (#98852). */
+      errorRetryAtReset: (time: string) => string
+      /** Countdown shown while that retry is armed; `wait` is "12m 03s". */
+      errorRetryScheduled: (time: string, wait: string) => string
+      errorRetryScheduledCancel: string
       /** Escape hatch when Retry would only reproduce SESSION_NOT_OWNED (#106217). */
       errorStartNewSession: string
       errorSwitchProvider: string
@@ -3680,6 +3701,7 @@ export interface Translations {
       statusDone: string
       /** Over-budget / rejected memory write title — not "Saved to memory". */
       resultUnavailable: string
+      resultInterrupted: string
       memoryWriteNoted: string
       actions: {
         read: string
