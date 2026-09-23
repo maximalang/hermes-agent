@@ -121,8 +121,6 @@ def test_specify_updates_fields_and_promotes(orchestrator_env):
         "body": "task_type: research\n\n**Goal**\nDo the thing.",
         "assignee": "worker-b",
         "reason": "dispatcher flagged this card as too thin to dispatch",
-        # Unknown author-ish args must be ignored (anti-forgery, #19713).
-        "author": "hermes-system",
     })
     assert out["ok"] is True, out
     assert out["status"] == "ready"  # no parents → recompute promotes past todo
@@ -171,6 +169,21 @@ def test_specify_preserves_omitted_fields_exactly(orchestrator_env):
 
 def test_specify_requires_task_id(orchestrator_env):
     assert "task_id is required" in _handle_raw({})
+
+
+def test_specify_rejects_author_arg_as_unknown(orchestrator_env):
+    """Anti-forgery, #19713: the comment author comes from HERMES_PROFILE, never
+    from args — an ``author`` arg is rejected by the schema gate (fail closed,
+    nothing changed) rather than silently ignored."""
+    from hermes_cli import kanban_db as kb
+    with _connect() as conn:
+        tid = _create_triage(conn)
+    err = _handle_raw({"task_id": tid, "title": "x", "author": "hermes-system"})
+    assert "unknown parameter(s): author" in err
+    with _connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+    assert task.title == "rough idea"
 
 
 def test_specify_requires_at_least_one_field(orchestrator_env):

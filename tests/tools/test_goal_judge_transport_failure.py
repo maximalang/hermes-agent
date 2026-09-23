@@ -129,10 +129,16 @@ def test_complete_real_judge_rejection_still_rejects(monkeypatch, tmp_path):
             conn, title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        assert claimed is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    # A real dispatcher always pins the worker's run id; the unbound-worker guard
+    # (_RUN_LIFECYCLE_TOOLS) fail-closes run-lifecycle tools without it, so the
+    # judge rejection under test would never be reached (same pattern as
+    # test_complete_transport_failure_routes_to_review / test_kanban_tools.py).
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
     monkeypatch.setattr(kt, "_goal_judge_available", lambda: True)
     monkeypatch.setattr(
