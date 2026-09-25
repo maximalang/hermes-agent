@@ -3220,7 +3220,6 @@ export const ru = defineLocale({
     closePreviewsAndUpdate: 'Закрыть предпросмотры и обновить',
     closePreviewsAndCheckAgain: 'Закрыть предпросмотры и проверить снова',
     localPreview: 'Локальный предпросмотр',
-    fleetWorker: 'Воркер флота',
     portLabel: port => `Порт ${port}`,
     pidLabel: pid => `PID ${pid}`,
     technicalDetails: 'Технические детали',

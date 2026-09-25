@@ -4115,7 +4115,6 @@ export const en: Translations = {
     closePreviewsAndUpdate: 'Close previews and update',
     closePreviewsAndCheckAgain: 'Close previews and check again',
     localPreview: 'Local preview',
-    fleetWorker: 'Fleet worker',
     portLabel: port => `Port ${port}`,
     pidLabel: pid => `PID ${pid}`,
     technicalDetails: 'Technical details',
