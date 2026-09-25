@@ -13,13 +13,14 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, List
 
-import aiohttp
-
+aiohttp: Any = None
 try:
+    import aiohttp as _aiohttp
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
     from slack_sdk.web.async_client import AsyncWebClient
 
+    aiohttp = _aiohttp
     SLACK_AVAILABLE = True
 except ImportError:
     SLACK_AVAILABLE = False
@@ -59,11 +60,9 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 logger = logging.getLogger(__name__)
 
 # User-Agent prefix (``HermesAgent/<version>``) for platform-partner attribution of API calls.
-try:
-    from hermes_cli import __version__ as _HERMES_VERSION
-except Exception:
-    _HERMES_VERSION = "unknown"
-_HERMES_SLACK_USER_AGENT_PREFIX = f"HermesAgent/{_HERMES_VERSION}"
+from hermes_cli.version_info import get_version_info
+
+_HERMES_SLACK_USER_AGENT_PREFIX = f"HermesAgent/{get_version_info().base_version}"
 
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
 _BOOL_WORDS = frozenset({"1", "0", "true", "false", "yes", "no", "on", "off"})
@@ -322,7 +321,11 @@ class _NativeTaskCardStream:
 
 
 def check_slack_requirements() -> bool:
-    """Lazy-install slack-bolt/slack-sdk if missing and rebind module globals on success."""
+    """Check if Slack dependencies are available.
+
+    Lazy-installs the ``slack`` pyproject extra via ``pm.extras.ensure_and_bind``
+    on first call if not present. Rebinds all module-level globals on success.
+    """
     if SLACK_AVAILABLE:
         return True
 
@@ -335,8 +338,9 @@ def check_slack_requirements() -> bool:
             "AsyncApp": AsyncApp, "AsyncSocketModeHandler": AsyncSocketModeHandler,
             "AsyncWebClient": AsyncWebClient, "aiohttp": aiohttp, "SLACK_AVAILABLE": True}
 
-    from tools.lazy_deps import ensure_and_bind
-    return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
+    from pm.extras import ensure_and_bind
+
+    return ensure_and_bind("slack", _import, globals())
 
 
 def _collect_slack_block_mentions(blocks: list) -> list:
@@ -541,6 +545,11 @@ def _extract_text_from_slack_blocks(blocks: list) -> str:
 #: with whatever was pasted. 20k chars comfortably covers real tables while
 #: staying well under Slack's own 40k message ceiling.
 _SLACK_TABLE_MAX_CHARS = 20_000
+#: One ceiling for every ``attachments[].blocks[]`` projection in a message. Slack allows 20
+#: attachments each with its own blocks, so a per-attachment cap alone still grows 20x; the
+#: top-level ``blocks`` path is capped once (``_serialize_slack_blocks_for_agent``) and this
+#: keeps the unfurl path in the same order of magnitude.
+_SLACK_UNFURL_BLOCKS_MAX_CHARS = 6000
 
 
 def _collect_slack_table_cell_text(value: Any) -> str:
@@ -2357,7 +2366,8 @@ class SlackAdapter(BasePlatformAdapter):
             result = await self.edit_message(
                 chat_id, cached_id, content, finalize=False, metadata=metadata)
             if result.success:
-                if result.message_id:
+                # Only write back if nobody evicted/replaced this key during the await.
+                if result.message_id and self._status_message_ids.get(key) == cached_id:
                     self._status_message_ids[key] = str(result.message_id)
                 return result
             # Edit failed: drop cached ts, fall through to a fresh send.
@@ -4121,6 +4131,7 @@ class SlackAdapter(BasePlatformAdapter):
         own content and is skipped. Dedup matches the rendered section, not the bare URL (which is
         usually already in the user's text while the preview body is not)."""
         att_parts: list[str] = []
+        blocks_budget = _SLACK_UNFURL_BLOCKS_MAX_CHARS
         for att in slack_attachments:
             att_title = att.get("title", "")
             att_url = att.get("title_link", "") or att.get("from_url", "")
@@ -4138,8 +4149,15 @@ class SlackAdapter(BasePlatformAdapter):
                 body = body[:497] + "..."
             # Pasted tables arrive as ``table`` blocks in ``attachments[].blocks[]``, absent from
             # ``text``/``fallback``/files; without this the agent sees only the sentence before them.
-            nested_text = _extract_text_from_slack_blocks(att.get("blocks") or [])
+            # The budget is shared across the whole array: a 20-attachment alert must not project
+            # 20x what a single one does, and a spent budget still leaves the header visible.
+            nested_text = ""
+            if blocks_budget > 0:
+                nested_text = _extract_text_from_slack_blocks(att.get("blocks") or [])
+                if len(nested_text) > blocks_budget:
+                    nested_text = nested_text[:blocks_budget].rstrip() + "\n... [truncated]"
             if nested_text and nested_text not in body:
+                blocks_budget -= len(nested_text)
                 body = f"{body}\n{nested_text}".strip() if body else nested_text
             if header:
                 section = f"{header}\n   {body}" if body else header
@@ -6339,7 +6357,7 @@ def _load_slack_bot_tokens(raw_token: str, *, quiet: bool) -> List[str]:
             # File holds plaintext bot tokens; warn if group/world-readable.
             from utils import warn_if_credential_file_broadly_readable
             warn_if_credential_file_broadly_readable(tokens_file, label="[Slack]", log=logger)
-        saved = json.loads(tokens_file.read_text(encoding="utf-8"))
+        saved = json.loads(tokens_file.read_text(encoding="utf-8-sig"))
         for team_id, entry in saved.items():
             tok = entry.get("token", "") if isinstance(entry, dict) else ""
             if tok and tok not in tokens:
