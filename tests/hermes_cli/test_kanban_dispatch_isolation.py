@@ -17,14 +17,19 @@ def test_worker_uses_interpreter_from_its_own_install(monkeypatch, tmp_path):
     root = tmp_path / "installed-hermes"
     package = root / "hermes_cli"
     package.mkdir(parents=True)
-    interpreter = root / "venv" / "Scripts" / "python.exe"
-    interpreter.parent.mkdir(parents=True)
-    interpreter.touch()
+    # Materialize both interpreter layouts so the resolver's host branch
+    # finds the checkout's venv on Windows and on POSIX CI lanes alike.
+    windows_interpreter = root / "venv" / "Scripts" / "python.exe"
+    posix_interpreter = root / "venv" / "bin" / "python"
+    for candidate in (windows_interpreter, posix_interpreter):
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.touch()
+    expected = windows_interpreter if kb._IS_WINDOWS else posix_interpreter
     with monkeypatch.context() as patcher:
         patcher.setattr(kbd, "__file__", str(package / "kanban_db_dispatch.py"))
         patcher.delenv("HERMES_BIN", raising=False)
         argv = kbd._resolve_hermes_argv()
-    assert argv == [str(interpreter), "-m", "hermes_cli.main"]
+    assert argv == [str(expected), "-m", "hermes_cli.main"]
 
 
 def test_unavailable_profile_registry_never_claims_or_spawns(monkeypatch, tmp_path):
