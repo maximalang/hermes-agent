@@ -12,6 +12,11 @@ import sys
 import threading
 
 _INTERPRETER_PREFIXES = tuple({
+    # Keep BOTH the lexical install path and its resolved target: PM's managed
+    # Python on Windows has a junctioned base_prefix. stdlib tracebacks use the
+    # lexical path and would otherwise be mistaken for a live Hermes state read.
+    Path(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
+} | {
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
 } | {
     # A PM-activated developer shell runs sys.prefix's python against a dependency generation
