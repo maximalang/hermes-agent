@@ -18,14 +18,21 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
 # REPO / PY are overridable so the nightly layer-apply task can verify the LIVE
-# checkout (argv1 = repo path, argv2 = venv python). Defaults target the branch
-# worktree for local dev runs. The canary only ever writes to a throwaway
-# HERMES_HOME, so pointing it at the live checkout is read-only w.r.t. real boards.
+# checkout (argv1 = repo path, argv2 = PM-selected python). The canary must
+# isolate BOTH profile state and the shared Kanban root: when a scratch home is
+# beneath the native Hermes home, get_default_hermes_root() still resolves to
+# the real root unless HERMES_KANBAN_HOME is explicitly pinned.
 REPO = sys.argv[1] if len(sys.argv) > 1 else r"C:/Users/max/AppData/Local/Temp/autocompany-p0"
 PY = sys.argv[2] if len(sys.argv) > 2 else r"C:/Users/max/AppData/Local/hermes/hermes-agent/.venv/Scripts/python.exe"
-HOME = tempfile.mkdtemp(prefix="e2e-canary-")
+SCRATCH = Path(os.environ.get("HERMES_CANARY_SCRATCH") or (Path.home() / "AppData/Local/hermes/profiles/company/cache/scratch"))
+SCRATCH.mkdir(parents=True, exist_ok=True)
+ROOT = Path(tempfile.mkdtemp(prefix="e2e-canary-", dir=SCRATCH))
+HOME = str(ROOT / "profiles" / "company")
+Path(HOME).mkdir(parents=True, exist_ok=True)
+BOARD_HOME = str(ROOT / "board")
 FAILURES = []
 
 
@@ -58,6 +65,9 @@ def cli(*args, env_extra=None):
     env = dict(os.environ)
     env.update({
         "HERMES_HOME": HOME,
+        "HERMES_KANBAN_HOME": BOARD_HOME,
+        "HERMES_KANBAN_DB": str(Path(BOARD_HOME) / "canary.sqlite"),
+        "HERMES_KANBAN_BOARD": "default",
         "PYTHONPATH": REPO,
         "PYTHONIOENCODING": "utf-8",
     })
@@ -116,20 +126,16 @@ def main():
     # receipt readback straight from the sqlite run ledger:
     # _end_run attaches metadata['receipt'] atomically in the same txn
     import sqlite3
+    db_path = Path(BOARD_HOME) / "canary.sqlite"
     db = None
-    for root, _dirs, files in os.walk(HOME):
-        for f in files:
-            if f.endswith(".db"):
-                cand = os.path.join(root, f)
-                try:
-                    conn = sqlite3.connect(f"file:{cand}?mode=ro", uri=True)
-                    conn.execute("SELECT name FROM sqlite_master WHERE name='task_runs'").fetchone()
-                    db = conn
-                    break
-                except Exception:
-                    pass
-        if db:
-            break
+    if db_path.is_file():
+        try:
+            db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            if db.execute("SELECT name FROM sqlite_master WHERE name='task_runs'").fetchone() is None:
+                db.close()
+                db = None
+        except Exception:
+            db = None
     receipts = []
     if db:
         try:
@@ -146,7 +152,7 @@ def main():
         except Exception as exc:
             check("run ledger readable", False, str(exc))
     else:
-        check("kanban db found", False, HOME)
+        check("kanban db found", False, str(db_path))
     w_receipts = [r for r in receipts if r["task_id"] == w_id and r["receipt"]]
     check("durable auto receipt written", bool(w_receipts), json.dumps(receipts)[:300])
     if w_receipts:
