@@ -36,7 +36,14 @@ def test_unavailable_profile_registry_never_claims_or_spawns(monkeypatch, tmp_pa
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "sandbox"))
     monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
     spawned = []
-    monkeypatch.setattr(kbd, "_default_spawn", lambda *args, **kwargs: spawned.append(args))
+
+    # Named function, not a lambda: the layer contract identifies the
+    # gateway default spawn by __name__ (see test_kanban_unknown_profile_dispatch).
+    def _default_spawn(task, workspace, board=None):
+        spawned.append((task, workspace, board))
+        return None
+
+    monkeypatch.setattr(kbd, "_default_spawn", _default_spawn)
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unknown worker", assignee="missing-profile")
         result = kbd.dispatch_once(conn)
