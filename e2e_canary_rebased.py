@@ -208,12 +208,16 @@ if __name__ == "__main__":
     finally:
         # Isolated CLI state is disposable. Without this, each nightly canary
         # left a full copied runtime under the scratch root (or Windows Temp).
-        for attempt in range(5):
+        for attempt in range(30):
             try:
                 shutil.rmtree(ROOT)
                 break
-            except OSError:
-                if attempt == 4:
-                    raise
-                time.sleep(1)
+            except OSError as exc:
+                if attempt == 29:
+                    # Windows may briefly retain the SQLite file after the CLI
+                    # exits. Do not fail a passing release canary over cleanup;
+                    # the daily scratch sweeper retries stale directories.
+                    print(f"[WARN] canary scratch cleanup deferred: {ROOT}: {exc}", file=sys.stderr)
+                else:
+                    time.sleep(1)
     sys.exit(result)
