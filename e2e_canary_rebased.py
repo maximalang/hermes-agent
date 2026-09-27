@@ -14,6 +14,7 @@ Exit 0 = PASS, 1 = FAIL.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -202,4 +203,17 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        result = main()
+    finally:
+        # Isolated CLI state is disposable. Without this, each nightly canary
+        # left a full copied runtime under the scratch root (or Windows Temp).
+        for attempt in range(5):
+            try:
+                shutil.rmtree(ROOT)
+                break
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(1)
+    sys.exit(result)
