@@ -11,7 +11,7 @@ def test_windows_gateway_keeps_committed_pm_imports(monkeypatch, tmp_path):
     legacy.mkdir(parents=True)
     monkeypatch.setattr(run, "__file__", str(tmp_path / "gateway" / "run.py"))
     monkeypatch.setattr(run.sys, "platform", "win32")
-    monkeypatch.setattr(environments, "running_from_selected_environment", lambda root: True)
+    monkeypatch.setattr(environments, "committed_venv", lambda root: tmp_path / "committed")
     monkeypatch.setenv("VIRTUAL_ENV", str(legacy.parent.parent))
     before = sys.path[:]
     try:
