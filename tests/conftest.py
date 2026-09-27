@@ -121,6 +121,8 @@ if _HERMES_EXPORTED_TMP:
 from hermes_state_guard import _real_platform_state_root
 
 _real_test_root = _real_platform_state_root() or (Path.home() / ".hermes").resolve()
+# Inherited by fixture subprocesses even if they override LOCALAPPDATA later.
+os.environ["HERMES_TEST_REAL_KANBAN_ROOT"] = str(_real_test_root)
 _guarded_tmp_roots = [_real_test_root]
 _custom_test_home = os.environ.get("HERMES_HOME")
 if _custom_test_home:
@@ -142,6 +144,19 @@ if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
     # sandbox in the env and must not register it as a guarded "real" root.
     os.environ["HERMES_TEST_SANDBOX_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
+
+# Kanban has a shared root separate from HERMES_HOME. Redirect it before
+# collection imports: a gateway shell may export a live KANBAN_HOME/DB even
+# after the session's HERMES_HOME was sandboxed. Per-test isolation replaces
+# this with each test's own home later.
+_SESSION_KANBAN_HOME = tempfile.mkdtemp(prefix="hermes-test-kanban-")
+os.environ["HERMES_KANBAN_HOME"] = _SESSION_KANBAN_HOME
+for _kanban_key in (
+    "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_LOGS_ROOT",
+):
+    os.environ.pop(_kanban_key, None)
+atexit.register(shutil.rmtree, _SESSION_KANBAN_HOME, True)
 
 # PYTHONPYCACHEPREFIX is a bytecode-mirror escape hatch: when set (the
 # bundled desktop app exports it as %LOCALAPPDATA%\hermes\pycache),
@@ -607,9 +622,12 @@ def _capture_real_kanban_root() -> Path:
         # root matters).
         from hermes_constants import get_default_hermes_root
         return get_default_hermes_root().resolve()
-    # No pre-existing HERMES_HOME: the real root is the platform default,
-    # NOT the sandbox tempdir now sitting in the env.
-    return (Path.home() / ".hermes").resolve()
+    # No pre-existing HERMES_HOME: resolve the platform-native root, not
+    # Path.home()/.hermes (Windows production lives under LOCALAPPDATA).
+    native_root = _real_platform_state_root()
+    if native_root is None:
+        raise RuntimeError("kanban test isolation: production root unavailable")
+    return native_root
 
 
 _REAL_KANBAN_ROOT = _capture_real_kanban_root()

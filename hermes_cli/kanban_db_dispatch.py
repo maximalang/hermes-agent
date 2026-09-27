@@ -947,10 +947,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         outcome = row["outcome"] or ""
         if outcome == "rate_limited":
             continue
-        if outcome == "crashed" and (
-            _kb._json_dict(row["metadata"]).get("protocol_violation")
-            or "protocol violation" in (row["error"] or "")
-        ):
+        if outcome == "crashed" and _kb._json_dict(row["metadata"]).get("protocol_violation"):
             streak += 1
             continue
         break
@@ -2038,9 +2035,22 @@ def _dispatch_lane_task(
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
     # it by assigning a profile, and health telemetry suppresses "stuck" for it.
     profile_exists = _profile_exists_fn()
-    if profile_exists is not None and not profile_exists(assignee):
+    # An explicit spawn_fn is used by the CLI/test adapter and is itself the
+    # routing contract; the gateway's default spawn (and any direct caller
+    # passing None) must have a registry: never claim before the assignee is
+    # known spawnable. Registry lookup failures below fail closed (skip).
+    if profile_exists is None and (spawn_fn is None or spawn_fn.__name__ == "_default_spawn"):
         result.skipped_nonspawnable.append(task_id)
         return False
+    if profile_exists is not None:
+        try:
+            exists = profile_exists(assignee)
+        except Exception as exc:
+            _kb._log.warning("kanban: profile registry failed for %s: %s", assignee, exc)
+            exists = False
+        if not exists:
+            result.skipped_nonspawnable.append(task_id)
+            return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
     if per_profile_cap is not None:
@@ -2368,9 +2378,10 @@ def _dispatch_once_locked(
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     ):
         ready_budget = max(spawn_budget - 1, 0)
+    effective_spawn_fn = spawn_fn if spawn_fn is not None else _default_spawn
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
-        failure_limit=failure_limit, spawn_fn=spawn_fn,
+        failure_limit=failure_limit, spawn_fn=effective_spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
@@ -2468,9 +2479,21 @@ def _rotate_worker_log(
 
 
 def _module_hermes_argv() -> list[str]:
-    """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
-    return [sys.executable, "-m", "hermes_cli.main"]
+    """Run the CLI with this checkout's install interpreter when available.
+
+    Managed gateways can run under a different Python than the editable Hermes
+    install. ``find_spec`` in the gateway is not evidence that a worker started
+    from an unrelated workspace can import the module in a new process.
+    """
+    source_root = Path(__file__).resolve().parent.parent
+    if _kb._IS_WINDOWS:
+        candidates = (source_root / "venv" / "Scripts" / "python.exe",
+                      source_root / ".venv" / "Scripts" / "python.exe")
+    else:
+        candidates = (source_root / "venv" / "bin" / "python",
+                      source_root / ".venv" / "bin" / "python")
+    interpreter = next((str(p) for p in candidates if p.is_file()), sys.executable)
+    return [interpreter, "-m", "hermes_cli.main"]
 
 
 def _absolute_hermes_path(path: str) -> str:
@@ -2534,12 +2557,12 @@ def _hermes_path_argv(path: str) -> list[str]:
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
     (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
-    search, batch shims fall back to the module form) only when ``hermes_cli``
-    is not importable. The module argv must win over PATH: a PATH-first lookup
-    lets an attacker-planted ``hermes`` shadow the running install (#111569).
+    same-directory file), then this checkout's venv Python when present
+    (otherwise the running interpreter) with ``-m hermes_cli.main``, then
+    ``which("hermes")`` (Windows: safe PATH search, batch shims fall back to
+    the module form) only when ``hermes_cli`` is not importable. The module argv
+    must win over PATH: a PATH-first lookup lets an attacker-planted ``hermes``
+    shadow the running install (#111569).
     Mirrors ``gateway.run._resolve_hermes_bin``; local because ``hermes_cli``
     sits below ``gateway`` in the dependency order.
     """

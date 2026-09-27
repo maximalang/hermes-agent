@@ -76,3 +76,46 @@ class TestResetDelayOneTable:
 
         assert reset_delay_from_message("resets in the future, maybe") is None
         assert "reset_at" not in _normalize_error_context({"message": "resets in the future, maybe"})
+
+
+class TestAbsoluteResetAtStamp:
+    """``"... will reset at 2026-09-23 16:11:13"`` (zai 1310 Weekly/Monthly credit).
+
+    Naive stamps are interpreted as HOST-LOCAL wall clock. The provider's own
+    timezone may differ (zai stamps Beijing time), which over-benches by a few
+    hours — safe for a genuine exhaustion: the credential is spent either way.
+    """
+
+    def test_future_local_stamp_yields_seconds_until_it(self):
+        from datetime import datetime as _dt
+
+        when = _dt.now().astimezone().replace(microsecond=0) + timedelta(hours=2)
+        msg = f"Weekly/Monthly Limit Exhausted. Your limit will reset at {when:%Y-%m-%d %H:%M:%S}"
+        delay = reset_delay_from_message(msg)
+        assert delay is not None
+        assert abs(delay - 2 * 3600) <= 60
+
+    def test_past_stamp_yields_none(self):
+        from datetime import datetime as _dt
+
+        when = _dt.now().astimezone().replace(microsecond=0) - timedelta(hours=1)
+        msg = f"limit will reset at {when:%Y-%m-%d %H:%M:%S}"
+        assert reset_delay_from_message(msg) is None
+
+    def test_pool_cooldown_honours_the_stamp(self):
+        """The credential pool benches until the absolute stamp, not a flat TTL."""
+        import time
+        from datetime import datetime as _dt
+
+        from agent.credential_pool import _normalize_error_context
+
+        when = _dt.now().astimezone().replace(microsecond=0) + timedelta(days=1, hours=3)
+        msg = f"Weekly/Monthly Limit Exhausted. Your limit will reset at {when:%Y-%m-%d %H:%M:%S}"
+        normalized = _normalize_error_context({"message": msg, "reason": "1310"})
+        assert normalized.get("reset_at") is not None
+        assert abs(normalized["reset_at"] - time.time() - (27 * 3600)) <= 120
+
+    def test_relative_grammar_still_wins_over_nothing_and_coexists(self):
+        """An explicit retry-after in the same body still takes precedence."""
+        msg = "Rate limited. Retry after 30s; will reset at 2099-01-01 00:00:00"
+        assert reset_delay_from_message(msg) == 30.0
