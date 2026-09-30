@@ -217,16 +217,19 @@ def _refuse_lazy(name: str, what: str) -> InstallError:
     return error
 
 
-def _remove_entry(store: Store, entry_name: str) -> None:
+def _remove_entry(store: Store, entry_name: str, *, attempts: int = 5) -> None:
     """Remove a replaced or failed entry, retrying transient Windows holds.
 
     Corruption may leave a file where the directory belonged. Failure
     must propagate so recovery never claims to have removed surviving bytes.
+    Only ``_reclaim_retired`` — used strictly after the authoritative state
+    has committed — may turn a persistent hold into an honestly reported
+    retention.
     """
     import time
 
     entry = store.entry(entry_name)
-    for attempt in range(5):
+    for attempt in range(attempts):
         try:
             if entry.is_symlink() or not entry.is_dir():
                 entry.unlink(missing_ok=True)
@@ -236,15 +239,43 @@ def _remove_entry(store: Store, entry_name: str) -> None:
         except FileNotFoundError:
             return
         except OSError as e:
-            if attempt == 4:
+            if attempt == attempts - 1:
                 raise
             time.sleep(0.2 * (attempt + 1))
 
 
+def _reclaim_retired(store: Store, entry_name: str, *, context: str, attempts: int = 5) -> bool:
+    """Remove a retired tree after the authoritative state has committed.
+
+    A persistent Windows hold — a running exe, a loaded DLL — makes deletion
+    fail even though the replacement or rollback itself already succeeded.
+    Reporting that as a failed operation was the 2026-09-30 updater
+    incident: facts were committed, yet the run exited 1 deleting
+    ``.previous-git-*/usr/bin/bash.exe`` (WinError 5) and every retry died
+    the same way. Retention is a reclaim backlog, not a failure: keep the
+    bytes under their dot-name, report the retained path honestly (never
+    claim deletion), and let the next install retry — bounded by ``attempts``
+    per try. Returns True when removed, False when retained.
+    """
+    try:
+        _remove_entry(store, entry_name, attempts=attempts)
+        return True
+    except OSError as exc:
+        LOG.warning(
+            "retained %s (%s): %s — a later install retries reclamation",
+            store.entry(entry_name), context, exc,
+        )
+        return False
+
+
 def _remove_downloads(store: Store, artifacts: list[dict]) -> None:
-    """Release this package's archives after publication, under its store lock."""
+    """Release this package's archives after publication, under its store lock.
+
+    The fetch-<sha> cache is post-commit garbage (gc drops it, the next
+    install retries): a hold on it must not fail the committed operation.
+    """
     for artifact in artifacts:
-        _remove_entry(store, f"fetch-{artifact['sha256']}")
+        _reclaim_retired(store, f"fetch-{artifact['sha256']}", context="download cache")
 
 
 def _entry_verified(package: Package, fact: dict, store: Store, target: str) -> bool:
@@ -271,7 +302,11 @@ def _restore_previous_entry(store: Store, entry, previous) -> None:
             displaced.rename(entry)
         raise
     if had_entry:
-        _remove_entry(store, displaced.name)
+        # The displaced tree exists only because the restore rename COMPLETED,
+        # so its bytes are never authoritative. A hold on it must not fail the
+        # finished rollback — and must never mask the caller's original error
+        # (this runs inside _publish_entry's except path).
+        _reclaim_retired(store, displaced.name, context="displaced entry after a completed rollback")
 
 
 @contextmanager
@@ -290,18 +325,71 @@ def _publish_entry(package, store, staged, entry, previous_entry, target):
             _restore_previous_entry(store, entry, previous_entry)
         raise
     if previous_entry.exists():
-        _remove_entry(store, previous_entry.name)
+        # Facts (or the stage marker) have committed: a hold on the retired
+        # tree is a reclaim backlog, never a failed publication.
+        _reclaim_retired(store, previous_entry.name, context="retired entry after a committed publish")
+
+
+def _sweep_displaced(store: Store) -> None:
+    """Retry reclaiming .displaced-* trees that earlier holds retained.
+
+    A displaced tree only outlives a COMPLETED restore rename (or a
+    reclassification by ``_free_retired_slot``), so its bytes are never
+    authoritative and the sweep can never touch the current transaction:
+    it runs at settle time under the same install lock that serializes
+    publications, before any rename of this run mints a fresh displaced
+    name. One quick attempt per tree per install keeps a persistent hold
+    from taxing every operation with the full retry budget. The retention
+    bound is one tree per locked rollback/reclassification, each named in
+    the logs and retried until the hold releases (gc deliberately preserves
+    dot-dirs, so this sweep is the garbage class's only reclaim path).
+    """
+    try:
+        names = sorted(item.name for item in store.root.iterdir()
+                       if item.name.startswith(".displaced-"))
+    except OSError:
+        return
+    for name in names:
+        _reclaim_retired(store, name, attempts=1,
+                         context="displaced tree retained by an earlier hold")
+
+
+def _free_retired_slot(store: Store, previous_entry) -> None:
+    """Move a proven-garbage retired tree out of the deterministic
+    .previous- slot when a hold refuses its deletion.
+
+    The next publish renames the live entry into exactly this slot; leaving
+    it occupied would wedge every later replacement while the hold persists.
+    Loaded images refuse deletion but permit renames — that is how the
+    incident tree became ``.previous-git-*`` while bash.exe was running — so
+    reclassifying into the swept ``.displaced-`` garbage class usually
+    succeeds. If even the rename is refused, the slot stays honestly
+    occupied: the next publish then fails safe (its own rename refuses)
+    without ever touching the committed state.
+    """
+    import uuid
+
+    try:
+        previous_entry.rename(store.entry(f".displaced-{uuid.uuid4().hex}"))
+    except OSError as exc:
+        LOG.warning(
+            "retained %s in place; the restore-point slot stays occupied: %s",
+            previous_entry, exc,
+        )
 
 
 def _settle_previous_entry(package, store, entry, previous_entry, previous, target) -> None:
     """Finish or undo a publication an earlier install left behind."""
+    _sweep_displaced(store)
     if not previous_entry.exists():
         return
     # Facts commit last. Stages have no host-side commit record, so
     # an interrupted stage always restores its prior usable bytes.
     if (previous and previous.get("entry") == entry.name
             and _entry_verified(package, previous, store, target)):
-        _remove_entry(store, previous_entry.name)
+        if not _reclaim_retired(store, previous_entry.name,
+                                context="retired entry left by a committed publication"):
+            _free_retired_slot(store, previous_entry)
     else:
         _restore_previous_entry(store, entry, previous_entry)
 
