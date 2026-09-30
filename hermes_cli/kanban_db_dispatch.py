@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -79,6 +80,35 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# ---------------------------------------------------------------------------
+# Infra drain marker constants
+# ---------------------------------------------------------------------------
+
+# A long-lived dispatcher (embedded gateway watcher, ``hermes kanban daemon``)
+# records its in-flight workers here before a clean shutdown, so the NEXT
+# dispatcher can tell "killed by the drain/restart" from "the task's own code
+# crashed". TTL bounds how long a marker may excuse a death after it was
+# written; ``HERMES_KANBAN_INFRA_DRAIN_MARKER_TTL_SECONDS=0`` disables the
+# infra classification entirely (every death is then judged on exit evidence
+# alone — the pre-marker behaviour).
+DEFAULT_INFRA_DRAIN_MARKER_TTL_SECONDS = 24 * 3600  # 24 hours
+
+# Hard cap on the marker's worker list so a huge fleet still writes a small,
+# fast JSON file inside a shutdown path.
+_INFRA_DRAIN_MARKER_MAX_WORKERS = 512
+
+# POSIX termination signals a drain/restart uses (HUP, INT, KILL, TERM).
+# Deliberately NOT the fault signals (ILL/TRAP/ABRT/BUS/FPE/SEGV): those are
+# the worker's own bug and must stay genuine crashes.
+_INFRA_TERMINATION_SIGNALS = frozenset({1, 2, 9, 15})
+
+# Death kinds carrying NO in-band task failure that a fresh drain marker may
+# excuse: ``unknown`` (no reap-registry entry and no exit trailer — the worker
+# never ran its own epilogue, i.e. an external kill) and ``signaled`` with a
+# termination signal. Anything else (clean_exit, nonzero_exit, rate_limited,
+# terminal_provider, fault signals) is judged without the marker.
+_INFRA_CLASSIFIABLE_KINDS = frozenset({"unknown", "signaled"})
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -145,6 +175,11 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    infra_killed: list[str] = field(default_factory=list)
+    """Task ids whose workers were killed by an infrastructure drain/restart
+    (gateway planned stop, nightly-update taskkill) with no in-band task
+    failure, and were released to ``ready``/``review`` WITHOUT counting a
+    failure — a host event must never trip the circuit breaker."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -173,6 +208,8 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.infra_killed:
+            counts["infra_killed"] = counts.get("infra_killed", 0) + len(res.infra_killed)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -276,6 +313,206 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
         return None
     matches = _EXIT_TRAILER_RE.findall(raw or "")
     return int(matches[-1]) if matches else None
+
+
+# ---------------------------------------------------------------------------
+# Infra drain marker
+#
+# The positive witness that separates an INFRASTRUCTURE kill (gateway planned
+# stop / restart, nightly-update ``taskkill /T`` on the fleet) from a genuine
+# task crash. A long-lived dispatcher writes ``kanban_home()/kanban/
+# infra-drain.json`` on its clean shutdown, listing every in-flight worker it
+# owned (task_id, pid, spawn fingerprint, run_id, board). After the restart the
+# crash sweep consults the marker ONLY for deaths with no in-band task failure
+# (``_INFRA_CLASSIFIABLE_KINDS``) and ONLY when the dead worker is provably the
+# same process the marker listed (task_id + pid + exact ``"<epoch>|<start>"``
+# fingerprint agreement — missing/legacy/UNVERIFIED fingerprints fail closed).
+# A matched death is booked ``infra_killed``: requeued WITHOUT counting a
+# failure, spaced by the shared respawn cooldown, breaker never trips — the
+# same neutral semantics the ``rate_limited`` requeue and the
+# ``infrastructure`` spawn refusal already have.
+#
+# Criterion summary (infra vs genuine):
+#   infra    = fresh same-host drain marker lists THIS task+pid+fingerprint AND
+#              the death left no in-band evidence (no reap-registry exit code,
+#              no worker-log exit trailer; or a termination signal 1/2/9/15).
+#   genuine  = everything else: exit trailer / registry code (nonzero_exit,
+#              clean_exit protocol violation, rate-limit and terminal-provider
+#              sentinels keep their own dedicated paths), fault signals
+#              (SEGV/ABRT/...), or no marker coverage — unchanged ``crashed``
+#              accounting with the failure counter and breaker.
+#
+# Known limitation (documented, pre-existing behaviour kept): a HARD kill of
+# the dispatcher itself (SIGKILL / ``taskkill /F`` with no drain) runs no
+# shutdown hook, so no marker is written and its workers' deaths stay booked
+# as crashes. Only clean drains are excusable — by design, fail closed.
+# ---------------------------------------------------------------------------
+
+_INFRA_DRAIN_MARKER_FILENAME = "infra-drain.json"
+
+
+def _infra_drain_marker_path() -> Path:
+    """``<kanban_home>/kanban/infra-drain.json`` — beside ``.dispatcher.lock``,
+    shared across profiles exactly like the board itself."""
+    return _kb.kanban_home() / "kanban" / _INFRA_DRAIN_MARKER_FILENAME
+
+
+def _resolve_infra_drain_marker_ttl_seconds() -> int:
+    """``HERMES_KANBAN_INFRA_DRAIN_MARKER_TTL_SECONDS`` (0 disables the infra
+    classification) else :data:`DEFAULT_INFRA_DRAIN_MARKER_TTL_SECONDS`."""
+    return _kb._env_int(
+        "HERMES_KANBAN_INFRA_DRAIN_MARKER_TTL_SECONDS",
+        DEFAULT_INFRA_DRAIN_MARKER_TTL_SECONDS,
+    )
+
+
+def write_infra_drain_marker(reason: str = "dispatcher_shutdown") -> Optional[str]:
+    """Record THIS host's in-flight kanban workers just before a clean dispatcher
+    shutdown; returns the marker path, or None when nothing could be written.
+
+    Called from the embedded gateway dispatcher watcher's shutdown paths and
+    from ``run_daemon``'s clean exit — never from a per-tick ``hermes kanban
+    dispatch`` process (it owns nothing that is about to die; a marker from it
+    would excuse later genuine crashes of workers it merely observed).
+
+    Best-effort by contract: shutdown paths must not fail because of this, so
+    every error is swallowed (debug-logged) and the return value is advisory.
+    The write is atomic (tmp + ``os.replace``) so a half-written marker can
+    never be read back.
+    """
+    try:
+        host = _kb._claimer_id().split(":", 1)[0]
+        workers: list[dict] = []
+        for meta in _kb.list_boards(include_archived=False):
+            slug = str(meta.get("slug") or "")
+            if not slug:
+                continue
+            conn = None
+            try:
+                conn = _kbc.connect(board=slug)
+                rows = conn.execute(
+                    "SELECT id, worker_pid, worker_started_at, current_run_id "
+                    "FROM tasks WHERE status = 'running' AND worker_pid IS NOT NULL "
+                    "AND claim_lock LIKE ?",
+                    (host + ":%",),
+                ).fetchall()
+            except Exception:
+                _kb._log.debug("infra drain marker: board %s unreadable", slug, exc_info=True)
+                continue
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+            for r in rows:
+                workers.append({
+                    "task_id": r["id"],
+                    "board": slug,
+                    "run_id": r["current_run_id"],
+                    "pid": int(r["worker_pid"]),
+                    "worker_started_at": r["worker_started_at"],
+                })
+                if len(workers) >= _INFRA_DRAIN_MARKER_MAX_WORKERS:
+                    break
+            if len(workers) >= _INFRA_DRAIN_MARKER_MAX_WORKERS:
+                break
+        marker = {
+            "host": host,
+            "written_at": int(time.time()),
+            "reason": reason,
+            "dispatcher_pid": os.getpid(),
+            "workers": workers,
+        }
+        path = _infra_drain_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(marker), encoding="utf-8")
+        os.replace(tmp, path)
+        _kb._log.info(
+            "kanban infra drain marker: %d in-flight worker(s) recorded (%s) -> %s",
+            len(workers), reason, path,
+        )
+        return str(path)
+    except Exception:
+        _kb._log.debug("infra drain marker: write failed", exc_info=True)
+        return None
+
+
+def _read_infra_drain_marker() -> Optional[dict]:
+    """The persisted drain marker, or None when absent/unreadable/malformed."""
+    try:
+        parsed = json.loads(_infra_drain_marker_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _infra_fingerprints_agree(marker_fp, row_fp) -> bool:
+    """Fail-closed identity check between the marker entry and the task row.
+
+    Both sides must carry a VERIFIED ``"<epoch>|<start>"`` spawn fingerprint
+    and agree exactly. Missing/legacy-int/UNVERIFIED fingerprints never excuse
+    a death: identity we cannot prove is identity we do not pardon (the same
+    refusal-not-permission rule ``_terminate_reclaimed_worker`` applies to
+    signalling, #99558).
+    """
+    return (
+        isinstance(marker_fp, str) and isinstance(row_fp, str)
+        and "|" in marker_fp and marker_fp == row_fp
+    )
+
+
+def _infra_drain_marker_match(
+    task_id: Optional[str], pid: Optional[int], worker_started_at,
+) -> Optional[dict]:
+    """Drain-marker evidence that THIS dead worker was an in-flight casualty of a
+    recent clean dispatcher shutdown, else None.
+
+    Conditions (all required): infra classification enabled (TTL > 0), marker
+    exists and names THIS host, marker is fresh (``0 <= now - written_at <=
+    ttl``; a future ``written_at`` beyond a small clock-skew allowance is
+    rejected), and one entry matches ``task_id`` + ``pid`` + verified spawn
+    fingerprint. The matched entry's context (reason, written_at, board,
+    run_id) is returned for the event payload.
+    """
+    ttl = _resolve_infra_drain_marker_ttl_seconds()
+    if ttl <= 0 or not task_id or not pid:
+        return None
+    marker = _read_infra_drain_marker()
+    if marker is None:
+        return None
+    host = _kb._claimer_id().split(":", 1)[0]
+    if marker.get("host") != host:
+        return None
+    written_at = marker.get("written_at")
+    if not isinstance(written_at, int) or isinstance(written_at, bool) or written_at <= 0:
+        return None
+    now = int(time.time())
+    age = now - written_at
+    if age < -300 or age > ttl:
+        return None
+    entries = marker.get("workers")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("task_id") != task_id:
+            continue
+        try:
+            entry_pid = int(entry.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if entry_pid <= 0 or entry_pid != int(pid):
+            continue
+        if not _infra_fingerprints_agree(entry.get("worker_started_at"), worker_started_at):
+            continue
+        return {
+            "reason": str(marker.get("reason") or "dispatcher_shutdown"),
+            "written_at": written_at,
+            "marker_age_seconds": age,
+            "dispatcher_pid": marker.get("dispatcher_pid"),
+            "board": entry.get("board"),
+            "run_id": entry.get("run_id"),
+        }
+    return None
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -947,6 +1184,10 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         outcome = row["outcome"] or ""
         if outcome == "rate_limited":
             continue
+        if outcome == "infra_killed":
+            # Neutral like ``rate_limited``: an infra drain/restart kill says
+            # nothing about the task's protocol compliance.
+            continue
         if outcome == "crashed" and (
             _kb._json_dict(row["metadata"]).get("protocol_violation")
             or "protocol violation" in (row["error"] or "")
@@ -1036,24 +1277,61 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    infra_killed: bool = False
+    """The worker died in a recorded infrastructure drain/restart with no in-band
+    task failure (see the infra drain marker section): requeued WITHOUT counting
+    a failure, breaker never trips — a host event is not the card's fault."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
+        # doesn't show a phantom crash for a quota wall. An infra-drain kill is
+        # recorded as ``infra_killed`` for the same reason: board history must
+        # not show a phantom crash for a gateway restart / nightly update.
+        if self.infra_killed:
+            return "infra_killed"
         return "rate_limited" if self.rate_limited else "crashed"
 
 
 def _classify_dead_worker(
     pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
+    worker_started_at=None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
     A clean exit or a crash carries the worker's own last output (``worker_output``
     in the event payload, appended to the error text) so the board and the retry
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
+
+    Infra overlay: a death with NO in-band task failure (``unknown`` — no registry
+    entry and no exit trailer — or a termination signal) whose process is listed
+    in a fresh same-host drain marker (``_infra_drain_marker_match``: task_id +
+    pid + verified spawn fingerprint all agree) is booked ``infra_killed``:
+    neutral requeue, failure counter untouched. Any in-band exit evidence
+    (trailer code, fault signal) wins over the marker — a genuine crash during a
+    drain window stays a genuine crash.
     """
     dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
+    if (
+        task_id
+        and dead.kind in _INFRA_CLASSIFIABLE_KINDS
+        # Fault signals (SEGV/ABRT/...) are the worker's own bug even mid-drain.
+        and not (dead.kind == "signaled" and dead.code not in _INFRA_TERMINATION_SIGNALS)
+    ):
+        drain = _infra_drain_marker_match(task_id, pid, worker_started_at)
+        if drain is not None:
+            return _DeadWorker(
+                "infra_killed", dead.code,
+                f"pid {pid} killed by an infrastructure drain/restart ({drain['reason']}) "
+                "— requeued without counting a failure",
+                "infra_killed",
+                {
+                    "pid": pid, "claimer": claimer, "exit_kind": dead.kind,
+                    **({"exit_code": dead.code} if dead.code is not None else {}),
+                    "drain": drain,
+                },
+                infra_killed=True,
+            )
     if task_id and not dead.rate_limited:
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
@@ -1135,6 +1413,7 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    infra_killed: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1166,7 +1445,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
 
             pid = int(row["worker_pid"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            dead = _classify_dead_worker(
+                pid, row["claim_lock"], task_id=row["id"], board=board,
+                worker_started_at=_kb._row_get(row, "worker_started_at"),
+            )
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1195,10 +1477,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.infra_killed or dead.protocol_violation:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
+                # blocker; an infra-killed requeue stamps the drain context for the
+                # board UI; a below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
                 # board UI and retry worker need the corrective message.
                 conn.execute(
@@ -1207,6 +1490,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.infra_killed:
+                # Neutral requeue: NOT a crash, no failure counted, breaker never
+                # sees it — the respawn guard spaces the retry instead.
+                sweep.infra_killed.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -1301,16 +1588,20 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     Clean exit while ``running`` is a protocol violation with a bounded
     violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
     wall, released WITHOUT counting a failure and surfaced via the
-    ``_last_rate_limited`` attribute (the return stays crashed-only).
+    ``_last_rate_limited`` attribute (the return stays crashed-only). A worker
+    killed by a recorded infrastructure drain/restart (no in-band task failure;
+    see the infra drain marker section) is likewise released WITHOUT counting a
+    failure, surfaced via ``_last_infra_killed``.
     """
     sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
-    # requeues did NOT count a failure and are NOT crashes.
+    # and infra-killed requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_infra_killed = sweep.infra_killed  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1529,7 +1820,8 @@ def check_respawn_guard(
 
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
-    refused — no restart-safe scope — within the cooldown; never counted),
+    refused — no restart-safe scope — or an ``infra_killed`` drain/restart
+    requeue, within the cooldown; never counted),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
@@ -1580,6 +1872,17 @@ def check_respawn_guard(
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
         # stamped rate-limit text; this path intentionally retries forever
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        return None
+    if latest_run is not None and latest_run["outcome"] == "infra_killed":
+        # An infra drain/restart kill shares the neutral semantics: spaced retry
+        # (the cooldown also prevents a respawn storm while a drain is still
+        # rolling), never the breaker, and after the cooldown return early so
+        # blocker_auth can't re-trap the stamped drain text.
+        if rl_cooldown <= 0:
+            return None
+        ended_at = latest_run["ended_at"]
+        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+            return "infrastructure_cooldown"
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
@@ -2197,10 +2500,12 @@ def _run_reclaim_phase(
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
     result.crashed = detect_crashed_workers(conn, board=board)
-    # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
-    # went back to ``ready`` and the respawn guard defers them until quota clears.
+    # Side-channel attributes (see detect_crashed_workers); rate-limited and
+    # infra-killed tasks went back to ``ready``/``review`` WITHOUT a counted
+    # failure and the respawn guard spaces their retry (quota / drain cooldown).
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.infra_killed.extend(getattr(detect_crashed_workers, "_last_infra_killed", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
@@ -3029,6 +3334,12 @@ def run_daemon(
             import traceback
             traceback.print_exc()
         stop_event.wait(timeout=interval)
+
+    # Clean stop (SIGINT / SIGTERM / stop_event): record this host's in-flight
+    # workers so the NEXT dispatcher books an infra kill (restart/drain, e.g. a
+    # nightly update) as a neutral ``infra_killed`` requeue instead of a counted
+    # ``crashed`` failure. Best-effort; never delays the exit.
+    write_infra_drain_marker(reason="daemon_shutdown")
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this

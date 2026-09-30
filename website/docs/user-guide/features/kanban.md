@@ -599,6 +599,33 @@ read its exit status — books the same death the same way the gateway-embedded
 dispatcher does; a worker killed before it reaches that line is a plain
 `crashed` (`pid <n> not alive`).
 
+**Exception — infrastructure kills are neutral.** A long-lived dispatcher (the
+gateway-embedded watcher or `hermes kanban daemon`) snapshots its in-flight
+workers into `<kanban_home>/kanban/infra-drain.json` right before a clean
+shutdown (planned stop, restart, nightly update). When the next dispatcher
+finds one of those workers dead, the death is booked `infra_killed` instead of
+`crashed`: the card returns to its source phase **without** counting
+`consecutive_failures`, so a gateway drain/restart can never walk a card into
+the circuit breaker. The infra-vs-genuine criterion is deliberately narrow —
+*all* of these must hold:
+
+- the death left **no in-band task failure**: no exit code in the reap
+  registry, no `[kanban-worker-exit]` trailer in the worker log (a worker that
+  reached its own epilogue failed itself), and — on POSIX — if a signal killed
+  it, a termination signal a drain uses (`HUP`/`INT`/`KILL`/`TERM`), never a
+  fault signal (`SEGV`/`ABRT`/…);
+- a drain marker from **this host** lists this exact worker: same `task_id`,
+  same `pid`, and the same verified spawn fingerprint (`worker_started_at`,
+  `"<epoch>|<start>"`) — missing/legacy/`unverified` fingerprints fail closed;
+- the marker is fresh (`HERMES_KANBAN_INFRA_DRAIN_MARKER_TTL_SECONDS`, default
+  24 h; `0` disables the classification entirely).
+
+Anything else stays a genuine `crashed` with the usual failure counting. The
+requeued card respawns after the shared cooldown (`infrastructure_cooldown` in
+`hermes kanban dispatch` output), which also prevents a respawn storm while a
+drain is still rolling. A hard kill of the dispatcher itself (no clean
+shutdown) writes no marker — its workers' deaths remain `crashed`, by design.
+
 **Agent-side prevention:** Before the worker exits, Hermes injects up to two
 synthetic nudges when it detects the model is about to stop without a terminal
 board tool call. This catches the common case where the model narrates the next
