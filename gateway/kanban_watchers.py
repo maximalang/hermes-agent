@@ -49,6 +49,22 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
+    def _write_kanban_infra_drain_marker(self, reason: str) -> None:
+        """Best-effort: record this host's in-flight kanban workers right before
+        the embedded dispatcher exits.
+
+        The next dispatcher uses the marker to book a worker death caused by
+        THIS shutdown (gateway drain/restart, a nightly update's taskkill on the
+        fleet) as a neutral ``infra_killed`` requeue instead of a counted
+        ``crashed`` failure feeding the circuit breaker. Must never fail or
+        delay the shutdown.
+        """
+        try:
+            from hermes_cli.kanban_db_dispatch import write_infra_drain_marker
+            write_infra_drain_marker(reason=reason)
+        except Exception:
+            logger.debug("kanban dispatcher: infra drain marker write failed", exc_info=True)
+
     async def _sleep_between_ticks(self, interval: float) -> None:
         """Sleep *interval* (floored to 1s) in 1s slices so stop() never waits a full interval."""
         interval = max(interval, 1.0)
@@ -316,6 +332,7 @@ class GatewayKanbanWatchersMixin:
                     last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
+                self._write_kanban_infra_drain_marker("gateway_shutdown_cancelled")
                 self._release_kanban_dispatcher_lock()
                 raise
             except Exception:
@@ -323,4 +340,5 @@ class GatewayKanbanWatchersMixin:
 
             await self._sleep_between_ticks(interval)
 
+        self._write_kanban_infra_drain_marker("gateway_shutdown")
         self._release_kanban_dispatcher_lock()
