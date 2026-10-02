@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import random
 import re
 import secrets
@@ -665,6 +666,37 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     return conn, out
 
 
+def _assert_test_kanban_isolation(path: Path) -> None:
+    """Refuse production Kanban DBs in pytest and its subprocess children.
+
+    The per-test ``connect`` monkeypatch cannot protect an early import or a
+    subprocess. Check the native root at the storage choke point, before mkdir,
+    schema migration, or even read-only/fenced opens. A scoped scratch DB below
+    the Hermes home is fine; only the real board DB layout is prohibited.
+    """
+    from hermes_state_guard import _in_test_context, _real_platform_state_root
+
+    if not _in_test_context():
+        return
+    native_root = _real_platform_state_root()
+    captured_root = os.environ.get("HERMES_TEST_REAL_KANBAN_ROOT", "").strip()
+    roots = [root for root in (native_root, Path(captured_root) if captured_root else None)
+             if root is not None]
+    if not roots:
+        raise RuntimeError("kanban test isolation: production root unavailable")
+    resolved = Path(path).expanduser().resolve()
+    for root in roots:
+        try:
+            parts = resolved.relative_to(root.resolve()).parts
+        except ValueError:
+            continue
+        if parts == ("kanban.db",) or (
+            len(parts) == 4 and parts[:2] == ("kanban", "boards")
+            and parts[-1] == "kanban.db"
+        ):
+            raise RuntimeError("kanban test isolation: refusing a production board DB")
+
+
 def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB. WAL is (re)enabled on
     every connection so a re-created file stays robust; the first connection
@@ -673,6 +705,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
     ``<root>/kanban/current`` -> ``default``)."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    _assert_test_kanban_isolation(path)
     from agent.delegation_context import kanban_path_is_fenced
     if kanban_path_is_fenced(path):
         # Reads must not enter schema/backfill write transactions. Never create a
@@ -758,6 +791,7 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
     migration pass — callers that know the on-disk schema may have drifted
     (tests writing legacy event kinds, external upgrades) use it to force it."""
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    _assert_test_kanban_isolation(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Clear the cache entry so connect() re-runs schema + migrations.
     with _INIT_LOCK:

@@ -77,6 +77,10 @@ _RESETS_IN_RE = re.compile(
 _RETRY_AFTER_SECONDS_RE = re.compile(r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)", re.IGNORECASE)
 # The plan usage-limit body field as it appears once stringified: ``'resets_in_seconds': 30995``.
 _RESETS_IN_SECONDS_FIELD_RE = re.compile(r"resets_in_seconds\W{1,4}(\d+(?:\.\d+)?)", re.IGNORECASE)
+# Absolute wall-clock stamp in message text: "Your limit will reset at 2026-09-23 16:11:13".
+_RESET_AT_RE = re.compile(
+    r"resets?\s+at\s+(\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(?::\d{2})?)", re.IGNORECASE,
+)
 
 
 def _quota_reset_seconds(m: "re.Match[str]") -> float:
@@ -90,6 +94,23 @@ def _resets_in_seconds(m: "re.Match[str]") -> Optional[float]:
     return float(m.group(1) or 0) * 3600 + float(m.group(2) or 0) * 60 + float(m.group(3) or 0)
 
 
+def _reset_at_delay_seconds(m: "re.Match[str]") -> Optional[float]:
+    """Seconds until an absolute ``reset at YYYY-MM-DD HH:MM[:SS]`` wall-clock stamp.
+
+    Naive stamps carry no timezone; interpret them as host-local wall clock. The
+    provider's own timezone may differ, which can over-bench by a few hours —
+    safe for a genuine exhaustion (the credential is spent either way), and
+    documented here for honesty. A stamp already in the past yields None so the
+    table falls through to the next grammar / the default TTL.
+    """
+    try:
+        when = datetime.fromisoformat(m.group(1).replace(" ", "T", 1))
+    except ValueError:
+        return None
+    delay = (when.astimezone() - datetime.now(timezone.utc)).total_seconds()
+    return delay if delay > 0 else None
+
+
 # An explicit "retry after N s" wins over "resets in ..." (the credential pool's precedence):
 # a body carrying both describes a short throttle inside a long quota window, and the
 # shorter explicit wait is the one the provider actually asks for.
@@ -97,6 +118,7 @@ RETRY_DELAY_PATTERNS = (
     (_QUOTA_RESET_DELAY_RE, _quota_reset_seconds),
     (_RETRY_AFTER_SECONDS_RE, lambda m: float(m.group(1))),
     (_RESETS_IN_SECONDS_FIELD_RE, lambda m: float(m.group(1))),
+    (_RESET_AT_RE, _reset_at_delay_seconds),
     (_RESETS_IN_RE, _resets_in_seconds),
 )
 

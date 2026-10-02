@@ -118,6 +118,22 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     return cleaned
 
 
+def clear_inherited_delegate_fence() -> str | None:
+    """Remove an inherited ``HERMES_DELEGATED_CHILD_CONTEXT`` from ``os.environ``.
+
+    The gateway IS the Kanban dispatcher owner: it holds the singleton dispatch
+    lock and spawns workers, so a delegate-child fence inherited through its
+    launch lineage (a restart fired from inside a delegate_task child, a
+    supervisor whose env was scrubbed) would fence the entire kanban root and
+    fail every dispatcher tick with PermissionError — a silent fleet-wide
+    outage (2026-09-18: 14 boards failed for 40+ minutes). Clearing the marker
+    is safe: a real delegate child never runs ``gateway run``/``serve``.
+    Returns the removed marker value, or None when the env was clean.
+    """
+    inherited = os.environ.pop(DELEGATED_CHILD_ENV_MARKER, "")
+    return inherited or None
+
+
 def kanban_path_is_fenced(path: "os.PathLike[str] | str") -> bool:
     """Whether Kanban mutations at *path* (a board DB or board-metadata root) are denied for this
     process: always for an in-process delegate child (the parent's own board); for a spawned

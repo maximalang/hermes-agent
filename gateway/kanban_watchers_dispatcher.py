@@ -29,6 +29,11 @@ def _kbd():
 
 _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
 
+# Consecutive per-board PermissionError ticks before the watcher escalates to a
+# fleet alert. Module-level so gateway/kanban_watchers.py shares the exact value
+# even when tests stub the dispatcher class.
+_PERMISSION_ERROR_ALERT_THRESHOLD = 3
+
 
 @dataclass
 class _DispatcherSettings:
@@ -129,10 +134,18 @@ class _KanbanDispatcher:
 
     CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
 
+    # Consecutive per-board PermissionError ticks before the watcher escalates
+    # to a fleet alert (#t_baed78d9: a delegate-child fence left 14 boards
+    # failing silently for 40+ minutes because nothing consumed the log noise).
+    PERMISSION_ERROR_ALERT_THRESHOLD = _PERMISSION_ERROR_ALERT_THRESHOLD
+
     def __init__(self, kb: Any, settings: _DispatcherSettings) -> None:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        # slug -> consecutive PermissionError ticks; cleared on any success or
+        # non-permission failure so only a *persistent* access denial escalates.
+        self.permission_error_streaks: dict[str, int] = {}
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -186,8 +199,27 @@ class _KanbanDispatcher:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
             conn = _kbc().connect(board=slug)
-            return _kbd().dispatch_once(conn, board=slug, **kwargs)
+            result = _kbd().dispatch_once(conn, board=slug, **kwargs)
         except Exception as exc:
+            if isinstance(exc, PermissionError):
+                # Persistent access denial (delegate-child fence, read-only DB
+                # file, revoked directory): count consecutive ticks so the
+                # watcher can escalate instead of only logging per tick.
+                streak = self.permission_error_streaks.get(slug, 0) + 1
+                self.permission_error_streaks[slug] = streak
+                if streak >= self.PERMISSION_ERROR_ALERT_THRESHOLD:
+                    logger.error(
+                        "[FLEET ALERT] kanban dispatcher: board %s tick failed with "
+                        "PermissionError for %d consecutive ticks (%s) — dispatch on "
+                        "this board is persistently denied (delegate-child fence, "
+                        "read-only database, or a revoked kanban root). No tasks will "
+                        "spawn until the access denial is resolved.",
+                        slug, streak, exc,
+                    )
+                else:
+                    logger.exception("kanban dispatcher: tick failed on board %s", slug)
+                return None
+            self.permission_error_streaks.pop(slug, None)
             if self.is_corrupt_board_db_error(exc):
                 self.disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
                 logger.error(
@@ -201,6 +233,9 @@ class _KanbanDispatcher:
                 return None
             logger.exception("kanban dispatcher: tick failed on board %s", slug)
             return None
+        else:
+            self.permission_error_streaks.pop(slug, None)
+            return result
         finally:
             if conn is not None:
                 with contextlib.suppress(Exception):

@@ -318,8 +318,10 @@ _SPECS = [
         _bulk_ids("block"),
         _arg("--kind", choices=sorted(kb.VALID_BLOCK_KINDS),
              help="Typed block reason. 'dependency' waits in todo (auto-promoted when "
-                  "parents finish, no human); 'needs_input'/'capability' go to "
-                  "blocked for a human; 'transient' marks a maybe-flaky failure. "
+                  "parents finish, no human); 'needs_input'/'capability'/'policy_denied' "
+                  "go to blocked for a human ('policy_denied' = Fleet Policy refuse with "
+                  "a remediation route; not a crash, retry only after the denied "
+                  "precondition changes); 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
     ], help="Mark one or more tasks blocked"),
@@ -386,6 +388,12 @@ _SPECS = [
         _arg("--interval", type=float, default=0.5, help="Poll interval in seconds (default: 0.5)"),
     ], help="Live-stream task_events to the terminal (Ctrl+C to exit)"),
     _cmd("stats", [_json_flag()], help="Per-status + per-assignee counts + oldest-ready age"),
+    _cmd("metrics", [
+        _json_flag(),
+        _arg("--window-days", type=int, default=28,
+             help="Lookback window in days (default: 28)"),
+    ], help="Read-only lifecycle outcome metrics (receipt coverage, violations, "
+            "policy denies, median completion, retry rate, stuck tasks)"),
     _cmd("notify-subscribe", [
         _TASK_ID,
         *_NOTIFY_TARGET,

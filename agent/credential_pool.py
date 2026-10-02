@@ -138,6 +138,13 @@ EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60
 # credential cools down briefly instead.
 EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS = 60
 
+# Transient 429 with no usable provider reset stamp (per-minute RPM throttles):
+# an hour-long bench strands a credential whose quota window is fine — the
+# throttle clears in seconds. Walk a streak-driven ladder instead; any success
+# resets the streak (_CLEAR_STATUS). The top rung keeps a persistently-throttled
+# key mostly out of rotation without a permanent bench.
+TRANSIENT_429_LADDER_SECONDS = (60, 300, 900)
+
 # ``FailoverReason.billing`` as a bare string: the pool persists classified
 # failure semantics to JSON and must not import the classifier.
 FAILURE_REASON_BILLING = "billing"
@@ -195,6 +202,7 @@ _CLEAR_STATUS: Dict[str, Any] = {
     "last_error_reason": None,
     "last_error_message": None,
     "last_error_reset_at": None,
+    "consecutive_429": 0,
 }
 _MARK_OK: Dict[str, Any] = {**_CLEAR_STATUS, "last_status": STATUS_OK}
 
@@ -233,6 +241,10 @@ class PooledCredential:
     agent_key: Optional[str] = None
     agent_key_expires_at: Optional[str] = None
     request_count: int = 0
+    # Streak of back-to-back stamp-less transient 429s on this entry; drives the
+    # TRANSIENT_429_LADDER_SECONDS cooldown. Cleared with the rest of the error
+    # state on any success (_CLEAR_STATUS).
+    consecutive_429: int = 0
     # A provider may rate-limit one model while the same credential remains
     # usable for its sibling models.  Keep that observation separate from the
     # credential-wide status used for auth and billing failures.
@@ -374,6 +386,7 @@ def _exhausted_ttl(
     *,
     sole_credential: bool = False,
     failure_reason: Optional[str] = None,
+    consecutive_429: Optional[int] = None,
 ) -> int:
     """Return cooldown seconds based on the HTTP status that caused exhaustion.
 
@@ -387,6 +400,14 @@ def _exhausted_ttl(
     bench regardless of status; 402 is billing by definition.
     Unverified billing (#82154) gets the short cooldown regardless of pool
     size (the credential may be healthy), unless the status is a true 402.
+
+    *consecutive_429*: streak of back-to-back stamp-less 429s on this entry
+    (persisted field, cleared on any success). A 429 with no usable provider
+    reset stamp is a short-window throttle (per-minute RPM class): walk
+    TRANSIENT_429_LADDER_SECONDS instead of the flat hour so a credential whose
+    quota window is fine re-enters rotation in a minute, while a persistently
+    throttled one converges to the top rung. ``None`` (streak not tracked, e.g.
+    model-scoped cooldowns) keeps the historical flat TTL.
     """
     if error_code == 401:
         return EXHAUSTED_TTL_401_SECONDS
@@ -394,6 +415,9 @@ def _exhausted_ttl(
     if failure_reason == FAILURE_REASON_BILLING_UNVERIFIED and error_code != 402:
         return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
     is_billing = error_code == 402 or failure_reason == FAILURE_REASON_BILLING
+    if not is_billing and error_code == 429 and consecutive_429 is not None:
+        rung = min(max(int(consecutive_429) - 1, 0), len(TRANSIENT_429_LADDER_SECONDS) - 1)
+        base = TRANSIENT_429_LADDER_SECONDS[rung]
     if sole_credential and not is_billing:
         return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
     return base
@@ -476,6 +500,7 @@ def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) 
             entry.last_error_code,
             sole_credential=sole_credential,
             failure_reason=entry.failure_reason,
+            consecutive_429=entry.consecutive_429,
         )
     return None
 
@@ -1242,6 +1267,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             updated_extra["failure_reason"] = failure_reason
         else:
             updated_extra.pop("failure_reason", None)
+        # Streak of stamp-less transient 429s drives the ladder in _exhausted_ttl.
+        # A stamped reset or a billing verdict is not a short-window throttle, so
+        # the streak does not apply and resets.
+        transient_429 = (
+            status_code == 429
+            and failure_reason != FAILURE_REASON_BILLING
+            and normalized_error.get("reset_at") is None
+        )
         return self._adopt(
             entry,
             persist=persist,
@@ -1251,6 +1284,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
             last_error_reset_at=normalized_error.get("reset_at"),
+            consecutive_429=int(entry.consecutive_429 or 0) + 1 if transient_429 else 0,
             extra=updated_extra,
         )
 
