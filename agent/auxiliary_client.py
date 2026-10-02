@@ -7284,11 +7284,28 @@ def _resolve_call_client(
             api_key=resolved_api_key or api_key, async_mode=async_mode, main_runtime=main_runtime,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
-            logger.warning("Vision provider %s unavailable, falling back to auto vision backends",
-                           resolved_provider)
-            effective_provider, client, final_model = resolve_vision_provider_client(
-                provider="auto", model=resolved_model, async_mode=async_mode,
-                main_runtime=main_runtime)
+            # Explicit vision provider with no credentials: honor the task fallback_chain
+            # first (mirror of the non-vision branch below) — chain entries may resolve
+            # through OAuth / pool auth the direct build could not see.
+            fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
+                task, resolved_provider)
+            if fb_client is not None:
+                client, final_model = fb_client, fb_model
+                if async_mode:
+                    client, final_model = _to_async_client(
+                        fb_client, fb_model or "", is_vision=True)
+                effective_provider = fb_label or resolved_provider
+            else:
+                logger.warning(
+                    "Vision provider %s unavailable, falling back to auto vision backends",
+                    resolved_provider)
+                # Auto-route with model=None so each candidate uses its own default — the
+                # unavailable provider's model name must never ride along to another
+                # endpoint (02.10: a codex model forced onto the custom main route 404'd).
+                # Direct _vision_auto_route: resolve_vision_provider_client would re-inject
+                # auxiliary.vision.model, which belongs to the failed provider.
+                effective_provider, client, final_model = _vision_auto_route(
+                    _normalize_main_runtime(main_runtime), None, resolved_api_mode, async_mode)
         if client is not None:
             resolved_provider = effective_provider or resolved_provider
     else:
@@ -7416,6 +7433,12 @@ class _LadderStep(NamedTuple):
 _FALLBACK_REASONS: Tuple[Tuple[Callable[[Exception], bool], str], ...] = (
     (_is_auth_error, "auth error"), (_is_payment_error, "payment error"),
     (_is_rate_limit_error, "rate limit"), (_is_model_incompatible_error, "model incompatible with route"),
+    # A model_not_found 404 is this route's capacity failure — a long-lived process pinned a
+    # since-dropped model, or a foreign model name rode along to an endpoint that never had it
+    # (02.10 vision incident: task chain configured, but reason=None left it unconsulted and the
+    # ladder re-raised). Billing lookalikes stay with "payment error" (checked first above;
+    # _is_model_not_found_error excludes billing keywords).
+    (_is_model_not_found_error, "model not found"),
     (_is_invalid_aux_response_error, "invalid provider response"),
     # A status-less in-stream ``error`` event (SSE committed 200) is a route failure (#101538).
     (_is_statusless_structured_provider_error, "structured provider error"),
@@ -7451,7 +7474,7 @@ def _param_rung_accepts(exc: Exception) -> bool:
             or _is_unsupported_parameter_error(exc, "temperature")
             or _is_reasoning_field_rejection(exc) or _is_reasoning_required_rejection(exc)
             or _is_structured_output_rejection(exc)
-            or _is_model_incompatible_error(exc))
+            or _is_model_incompatible_error(exc) or _is_model_not_found_error(exc))
 
 
 def _credential_rung_accepts(exc: Exception) -> bool:
