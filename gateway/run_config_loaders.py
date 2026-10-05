@@ -98,6 +98,44 @@ class GatewayConfigLoadersMixin:
             return prompt
         return resolve_ephemeral_system_prompt_from_config(_load_gateway_config())
 
+    def _channel_override_config_for_source(self, source):
+        """The :class:`GatewayConfig` whose ``channel_overrides`` govern ``source``.
+
+        Under multiplex a routed profile's channel rules live in ITS typed config
+        (``_profile_configs``, populated by ``run_adapters._start_one_profile_adapters``),
+        never in the launch profile's ``self.config`` — reading the launch config silently
+        ignores the served profile's native model/provider rules (#TGR-01: fresh company
+        Telegram topics resolved the launch profile's Sol instead of qwen3.8-max/custom).
+        Name resolution mirrors ``_resolve_profile_home_for_source``: pinned
+        ``RoutingIdentity`` → ``source.profile`` → configured ``profile_routes``. Every miss
+        (standalone, primary, unserved/unknown profile, route rejection, no cache entry)
+        falls back to the launch config — never to another profile's rules.
+        """
+        config = getattr(self, "config", None)
+        if not config or source is None or not getattr(config, "multiplex_profiles", False):
+            return config
+        try:
+            from gateway.session_identity import identity_of
+            name = None
+            identity = identity_of(source)
+            if identity is not None:
+                name = identity.session_key_profile
+            if not name:
+                name = getattr(source, "profile", None)
+            if not name:
+                resolver = getattr(self, "_profile_name_for_source", None)
+                if callable(resolver):
+                    name = resolver(source)
+            if not name:
+                return config
+            routed = (getattr(self, "_profile_configs", None) or {}).get(name)
+            return routed if routed is not None else config
+        except Exception:
+            # A rejected/broken route resolution (ProfileRouteRejected, served-set read
+            # failure) must never guess another profile's rules; the launch config is the
+            # existing safe fallback (same shape as ``_resolve_session_key_or_none``).
+            return config
+
     def _channel_override(self, platform: Platform, chat_id: str, thread_id, parent_id):
         """``channel_overrides`` entry for this channel/thread, or None (also when no config is bound)."""
         from gateway.run import _get_channel_override

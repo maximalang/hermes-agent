@@ -252,6 +252,10 @@ class GatewayTurnMixin:
 
         cfg = getattr(self, "config", None)  # getattr: bare object.__new__ test runners
         if cfg and source is not None:
+            # Under multiplex the ROUTED profile's typed config owns this channel's
+            # model/provider rules; the launch profile's config would silently ignore them
+            # (helper falls back to it for standalone/primary/unserved sources).
+            cfg = self._channel_override_config_for_source(source) or cfg
             ch = _get_channel_override(
                 cfg, source.platform, str(source.chat_id) if source.chat_id else "",
                 thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,

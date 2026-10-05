@@ -372,11 +372,50 @@ class GatewayModelCommandsMixin:
         cfg = getattr(self, "config", None)
         if not cfg or source is None:
             return None
+        # Under multiplex the ROUTED profile's typed config owns this chat's rules; keep
+        # /model's session-pin retention consistent with the turn runtime (#TGR-01).
+        cfg = self._channel_override_config_for_source(source) or cfg
         return _get_channel_override(
             cfg, source.platform, str(source.chat_id) if source.chat_id else "",
             thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
             parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
         )
+
+    async def _apply_channel_tier_to_context(self, ctx: _ModelSwitchContext, source) -> None:
+        """Align /model's current-route context with the route the next turn actually runs (#B1).
+
+        ``read_config`` only sees the profile's global route, so a chat governed by
+        ``channel_overrides`` got a listing/picker advertising a route the turn runtime never
+        executes (company Telegram DM/forum topics resolved qwen3.8-max/custom while the display
+        said Sol), and a relative switch resolved against the wrong "current". Runs BETWEEN
+        ``read_config`` and the session pin's ``apply_override`` so the turn runtime's precedence
+        is preserved: session /model pin > channel tier > profile global
+        (``run_turn.py::_resolve_session_agent_runtime``). Fail-open: a broken channel-provider
+        runtime resolution keeps the global route context — this is a read path.
+        """
+        ch = self._channel_override_for(source)
+        if ch is None or not (ch.model or ch.provider):
+            return
+        if ch.model:
+            ctx.current_model = ch.model
+        if not ch.provider:
+            return
+        ctx.current_provider = ch.provider
+        ctx.route_provider = ch.provider
+        try:
+            from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+            # Off-loop: credential resolution can refresh an OAuth token, as on the turn path.
+            runtime = await asyncio.to_thread(
+                _resolve_runtime_agent_kwargs_for_provider, ch.provider, target_model=ctx.current_model or None)
+        except Exception:
+            return
+        ctx.current_base_url = runtime.get("base_url") or ctx.current_base_url
+        ctx.current_api_key = runtime.get("api_key") or ctx.current_api_key
+        bundled = runtime.get("model")
+        if bundled and not ch.model:
+            # Adopt the provider's bundled default only when the channel rule named no model
+            # (same adoption rule as the turn runtime).
+            ctx.current_model = bundled
 
     def _model_switch_lock(self) -> asyncio.Lock:
         """Runner-wide lock over a /model command's read-resolve-commit. Slash commands bypass the busy
@@ -583,6 +622,10 @@ class GatewayModelCommandsMixin:
             restore_snapshot=self._snapshot_session_model_override(session_key) if request.is_once else None,
         )
         ctx.read_config()
+        # #B1 parity: the routed channel tier is the route the next turn actually runs; apply it
+        # BEFORE the session pin so /model's display precedence matches the turn runtime
+        # (session /model pin > channel_overrides > profile global).
+        await self._apply_channel_tier_to_context(ctx, source)
         ctx.apply_override(self._session_model_overrides.get(session_key, {}))
         if not request.target and not request.explicit_provider:
             return await self._model_listing_reply(event, ctx, profile_home)
