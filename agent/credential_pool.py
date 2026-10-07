@@ -974,6 +974,12 @@ REFRESHABLE_OAUTH_PROVIDERS = frozenset({"anthropic", "nous", *_TOKENS_SINGLETON
 # its refresh path serializes on its own auth-store lock (``_refresh_entry_impl`` nous branch).
 _SINGLE_USE_REFRESH_PROVIDERS = ("openai-codex", "xai-oauth", "anthropic")
 
+# Lock-free window between consecutive auth-store holds in a deferred refresh sweep
+# (_refresh_pending_entries): a waiter with a shorter timeout (Desktop assistant start,
+# AUTH_LOCK_TIMEOUT_SECONDS = 15s) can acquire between two entries' holds instead of
+# starving behind the whole chain of single-use refreshes (#124533).
+_REFRESH_SWEEP_SPACING_SECONDS = 0.5
+
 _REFRESH_TIMEOUT_ENV_VARS = {
     "openai-codex": "HERMES_CODEX_REFRESH_TIMEOUT_SECONDS",
     "xai-oauth": "HERMES_XAI_REFRESH_TIMEOUT_SECONDS",
@@ -1040,6 +1046,16 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         """
         with self._lock:
             available, _pending = self._available_entries(model=model)
+            return bool(available)
+
+    def lift_reopened_cooldowns(self, *, model: Optional[str] = None) -> bool:
+        """Clear cooldowns that have elapsed or (Codex) reopened early, then report availability.
+
+        The lift ``select()`` performs, without leasing an entry. ``has_available`` and
+        ``next_available_at`` never run the early-reopen probe.
+        """
+        with self._lock:
+            available, _pending = self._available_entries(clear_expired=True, model=model)
             return bool(available)
 
     def next_available_at(self, *, model: Optional[str] = None) -> Optional[float]:
@@ -1528,7 +1544,13 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # there was no recovery path at all). Serialize through the shared
         # cross-process auth-store flock; a waiter's in-lock re-sync picks up
         # the winner's rotated token and skips the POST.
-        with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
+        # Root-owned single-use rows borrowed through the global-root fallback must
+        # serialize on the ROOT store's flock: the profile's own lock cannot exclude a
+        # sibling profile refreshing the same grant (fleet-ops t_1083df20, defect F4).
+        with _auth_store_lock(
+            timeout_seconds=self._single_use_refresh_lock_timeout(),
+            target_path=self._single_use_refresh_lock_target(entry),
+        ):
             if self.provider == "openai-codex":
                 synced = self._sync_entry_from_auth_store(entry)
                 if synced is not entry and not force and not self._entry_needs_refresh(synced):
@@ -1624,6 +1646,23 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         env_var = _REFRESH_TIMEOUT_ENV_VARS.get(self.provider, "HERMES_ANTHROPIC_REFRESH_TIMEOUT_SECONDS")
         refresh_timeout_seconds = auth_mod.env_float(env_var, 20)
         return max(float(auth_mod.AUTH_LOCK_TIMEOUT_SECONDS), float(refresh_timeout_seconds) + 5.0)
+
+    def _single_use_refresh_lock_target(self, entry: PooledCredential) -> Optional[Path]:
+        """Root auth.json when refreshing a borrowed root-owned row, else None.
+
+        ``None`` keeps the historical behavior exactly (the active store's lock).
+        gpt-free rows are root-owned single-use grants: a profile that resolved them
+        through the global-root fallback (``_borrowed_root_ids``) must serialize the
+        sync -> POST -> write-back transaction on the ROOT store's flock -- the
+        profile's own lock cannot exclude a sibling profile refreshing the same
+        grant, and a double-spent single-use refresh token revokes the grant for
+        every profile (fleet-ops t_1083df20, defect F4).
+        """
+        if self.provider != "gpt-free":
+            return None
+        if entry.id not in getattr(self, "_borrowed_root_ids", ()):
+            return None
+        return _borrowed_single_use_pool_root()
 
     def _commit_anthropic_rotation(
         self, entry: PooledCredential, refreshed: Dict[str, Any]
@@ -2004,8 +2043,20 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         Each refresh takes the cross-process ``_auth_store_lock`` (20+ s
         possible) and merges into the pool through the self-locking mutation
         primitives; failures are silently skipped.
+
+        Entries are refreshed one at a time with a lock-free spacing window
+        between consecutive holds: ``_refresh_entry`` legitimately keeps the
+        store lock across its POST (single-use-token safety — sync -> POST ->
+        write-back must be atomic across processes), so a back-to-back chain
+        of N holds can starve a waiter on the same profile's auth.json whose
+        timeout is shorter (a Desktop assistant start, AUTH_LOCK_TIMEOUT_SECONDS
+        = 15s, vs the holder's max(15s, refresh_timeout + 5s)) for the whole
+        sweep (#124533). A short window between holds lets the waiter's
+        50ms poll cadence interleave; the chain still finishes promptly.
         """
-        for entry in pending:
+        for index, entry in enumerate(pending):
+            if index:
+                time.sleep(_REFRESH_SWEEP_SPACING_SECONDS)
             self._refresh_entry(entry, force=False)
 
     def _reset_cleared_after(self, entry: PooledCredential) -> Optional[float]:
@@ -2101,6 +2152,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 ):
                     continue
                 if clear_expired:
+                    # The probe may have rotated this row's single-use token pair: clear the
+                    # cooldown on the live row, not on this pre-probe copy.
+                    entry = self._find(lambda e, i=entry.id: e.id == i) or entry
                     entry = self._adopt(entry, persist=False, **_MARK_OK)
                     cleared_any = True
             if refresh and self._entry_needs_refresh(entry):
