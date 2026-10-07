@@ -24,7 +24,10 @@ logger = logging.getLogger("hermes_cli.auth")
 # ``refresh_token_reused``.
 # Profiles must never receive a copy: ONE grant lives at the global root and named profiles read
 # it through the ``read_credential_pool`` root fallback.
-SINGLE_USE_REFRESH_POOL_PROVIDERS = frozenset({"anthropic", "openai-codex", "xai-oauth", "nous"})
+# ``gpt-free`` (fleet model-provider plugin) follows the same rule: its pooled OAuth rows carry
+# a single-use refresh token, are minted only at the global root, and must never fork into a
+# profile island (fleet-ops t_1083df20, defect F4).
+SINGLE_USE_REFRESH_POOL_PROVIDERS = frozenset({"anthropic", "openai-codex", "xai-oauth", "nous", "gpt-free"})
 
 # Singleton credential files holding the same single-use grants outside ``auth.json``. Copying one
 # into a profile re-seeds a forked pool row on the profile's next ``load_pool()``.
