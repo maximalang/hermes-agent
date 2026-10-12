@@ -111,6 +111,8 @@ class DispatchResult:
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
+    orphan_runs_reaped: list[int] = field(default_factory=list)
+    """Open ``task_runs`` ids closed as ``orphaned`` by :func:`reap_orphaned_runs`."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -572,6 +574,88 @@ def _worker_survived_termination(termination: dict) -> bool:
         and (termination.get("termination_attempted") or termination.get("signal_refused"))
         and not termination.get("terminated")
     )
+
+
+ORPHAN_RUN_MAX_AGE_ENV = "HERMES_KANBAN_ORPHAN_RUN_MAX_AGE_SECONDS"
+# Documented maximum age of an open ``task_runs`` row whose owner cannot be
+# verified from this host (remote claim lock, no pid). Override via the env var.
+DEFAULT_ORPHAN_RUN_MAX_AGE_SECONDS = 7 * 24 * 3600
+
+
+def reap_orphaned_runs(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[int]:
+    """Close open ``task_runs`` rows that no live worker can still own.
+
+    Canonical permanent reaper for the orphaned-run class (incident t_9090afcd:
+    run 2512 on archived t_b5bbe1c9 kept ``ended_at IS NULL`` with a dead pid,
+    which the ``running``-only sweeps never see). Runs once per dispatch tick
+    from :func:`_run_reclaim_phase`.
+
+    A run is reaped only when ALL hold:
+
+    - it is still open (``ended_at IS NULL``) and it is not the current run of a
+      ``running`` task (that run belongs to the crash/stale/timeout sweeps);
+    - a host-local owner pid is NOT alive (a live worker is always preserved,
+      including a worker of an archived/done task, which archive/terminal paths
+      terminate themselves);
+    - and one of: the task is archived/done or missing (``task_terminal``); the
+      host-local owner is dead and the run is no longer current
+      (``owner_dead``); or the run is older than the max age and its owner cannot
+      be verified from this host (``max_run_age``).
+
+    Reaping sets ``status``/``outcome`` to ``orphaned``, the ``error`` reason,
+    ``ended_at`` to now, and writes an ``orphan_run_reaped`` event in the same
+    transaction. The ``ended_at IS NULL`` guard makes repeated sweeps idempotent.
+    Returns the reaped run ids.
+    """
+    now = int(time.time()) if now is None else int(now)
+    max_age = _kb._env_int(ORPHAN_RUN_MAX_AGE_ENV, DEFAULT_ORPHAN_RUN_MAX_AGE_SECONDS, minimum=1)
+    host_prefix = _kb._host_prefix()
+    rows = conn.execute(
+        "SELECT r.id, r.task_id, r.claim_lock, r.worker_pid, r.started_at, "
+        "       t.status AS task_status, t.current_run_id "
+        "FROM task_runs r LEFT JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.ended_at IS NULL ORDER BY r.id"
+    ).fetchall()
+    reaped: list[int] = []
+    for row in rows:
+        run_id = int(row["id"])
+        tid = row["task_id"]
+        status = row["task_status"]
+        if status == "running" and row["current_run_id"] == run_id:
+            continue  # owned by the running-only reclaim sweeps
+        local = (row["claim_lock"] or "").startswith(host_prefix)
+        terminal = status in ("archived", "done", None)
+        if local and _kb._pid_alive(row["worker_pid"]):
+            continue  # genuinely live worker: preserve
+        if terminal:
+            reason = f"task_terminal:{status or 'missing'}"
+        elif local:
+            reason = "owner_dead"
+        elif now - int(row["started_at"] or now) > max_age:
+            reason = "max_run_age"
+        else:
+            continue  # remote, non-terminal, young: owner unverifiable, keep
+        with _kb.write_txn(conn):
+            cur = conn.execute(
+                "UPDATE task_runs SET status = 'orphaned', outcome = 'orphaned', error = ?, "
+                "       ended_at = ?, claim_expires = NULL "
+                "WHERE id = ? AND ended_at IS NULL",
+                (f"orphaned run reaped: {reason}", now, run_id),
+            )
+            if cur.rowcount != 1:
+                continue
+            conn.execute(
+                "UPDATE tasks SET current_run_id = NULL "
+                "WHERE id = ? AND current_run_id = ? AND status != 'running'",
+                (tid, run_id),
+            )
+            _kb._append_event(
+                conn, tid, "orphan_run_reaped",
+                {"reason": reason, "worker_pid": row["worker_pid"], "local": local},
+                run_id=run_id,
+            )
+        reaped.append(run_id)
+    return reaped
 
 
 def _defer_reclaim_for_live_worker(
@@ -2192,6 +2276,7 @@ def _run_reclaim_phase(
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    result.orphan_runs_reaped = reap_orphaned_runs(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
