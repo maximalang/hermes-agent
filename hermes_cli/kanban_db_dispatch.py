@@ -145,6 +145,17 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    infra: list[str] = field(default_factory=list)
+    """Task ids whose workers died on a provider/model *availability* wall rather
+    than on anything about the card (see ``_infra_diagnostic``). Neutral like
+    ``rate_limited`` — no failure counted — but tracked apart because a rail that
+    stays unavailable is what ``_INFRA_RAIL_MAX_CONSECUTIVE`` bounds."""
+    infra_parked: list[str] = field(default_factory=list)
+    """Subset of ``infra`` parked for the company lane this tick because the same
+    rail produced ``_INFRA_RAIL_MAX_CONSECUTIVE`` consecutive infra outcomes."""
+    infra_details: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` per infra reclaim: ``"provider_unavailable"`` |
+    ``"quota_window"``."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -276,6 +287,136 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
         return None
     matches = _EXIT_TRAILER_RE.findall(raw or "")
     return int(matches[-1]) if matches else None
+
+
+# ---------------------------------------------------------------------------
+# Provider / model availability ("infra") classification
+# ---------------------------------------------------------------------------
+#
+# A worker can die at STARTUP because the configured model or provider is
+# unavailable — a shared-key quota window, a transient rejection, or a model
+# the account cannot currently reach. The card is not defective: nothing about
+# its body ran. Booking that as a card failure inflates ``consecutive_failures``
+# and pushes healthy cards toward ``gave_up`` (the 33-card loop class of
+# 2026-10-14: t_fcc571ae, t_8e3623e9, t_c8fa0f13, t_3a302dee all died
+# byte-identically on provider=custom model=qwen-3.8-max while the same rail
+# answered OK minutes later).
+#
+# The distinction the sweep needs is NOT the raw exit code — the same wall
+# surfaces as 1 (unhandled), 75 (rate_limited) or 78 (terminal_provider)
+# depending on where the failure was noticed. It is the *diagnostic* the worker
+# left in its own log, read ANSI-stripped and never as a scraped TUI frame.
+
+# More than this many consecutive infra runs on the same rail parks the card
+# with an explicit marker for the company lane: bounded, so a permanently
+# unavailable rail cannot respawn forever, but far above a one-off window.
+_INFRA_RAIL_MAX_CONSECUTIVE = 3
+
+# CSI / OSC / single-char escape sequences. The worker's log is a rendered TUI:
+# box drawing, colour and cursor moves are chrome, and a raw escape blob must
+# never become a board-visible failure reason.
+_ANSI_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])"
+)
+
+# Provider says "I cannot serve this model right now" in its own words.
+_PROVIDER_UNAVAILABLE_SIGNATURE_RE = re.compile(
+    r"(?:model|provider|endpoint|service|api|assistant)[^\n]{0,40}\bnot\s+available\b"
+    r"|\bnot\s+available\s+on\s+the\s+free\s+tier\b"
+    r"|\bmodel_not_supported_on_free_tier\b"
+    r"|\b(?:please\s+)?(?:try\s+again|retry)\b[^\n]{0,30}\bright\s+now\b"
+    r"|\bprovider[^\n]{0,30}\b(?:reject|refus|unavailab)"
+    r"|\bno\s+(?:available\s+)?(?:capacity|route)\b[^\n]{0,30}\bmodel\b",
+    re.IGNORECASE,
+)
+
+# A quota window with a stated reset — the provider-scoped form only, so
+# ordinary worker prose mentioning "quota" cannot reclassify a real failure.
+_QUOTA_WINDOW_SIGNATURE_RE = re.compile(
+    r"\blimit\s+resets?\s+at\b"
+    r"|\bretry\s+after\s+\d"
+    r"|\brate[\s_]?limit[^\n]{0,40}(?:provider|model|api|please|retry|exceeded)"
+    r"|\bquota[^\n]{0,40}(?:provider|model|api|exceeded|reached|reset)",
+    re.IGNORECASE,
+)
+
+
+def _strip_ansi(text: str) -> str:
+    """Drop TUI escape sequences (colour/cursor/OSC) from captured worker output."""
+    return _ANSI_RE.sub("", text or "")
+
+
+def _sanitize_diagnostic(raw: str) -> str:
+    """Board-safe one-line diagnostic from a worker log tail.
+
+    Mirrors ``_worker_final_output``'s trimming (exit-summary cut, chrome and
+    ``session_id:`` noise) but keeps an explicit ANSI strip FIRST, so a stored
+    ``last_failure_error`` can never carry a raw escape blob or a scraped TUI
+    frame instead of the provider's own words.
+    """
+    text = _strip_ansi(raw or "")
+    text = _EXIT_TRAILER_RE.sub("", text)
+    cut = text.rfind(_EXIT_SUMMARY_MARKER)
+    if cut != -1:
+        text = text[:cut]
+    lines = []
+    seen: set[str] = set()
+    for ln in text.splitlines():
+        ln = _LOG_CHROME.sub("", ln).strip()
+        if not ln or ln.startswith(_LOG_NOISE_PREFIXES):
+            continue
+        # The worker log is opened in append mode and a re-run appends, so the
+        # tail can repeat the same provider sentence once per spawn (plus the
+        # dispatcher's own ``Provider said:`` recap). Keep the first occurrence
+        # only, or ``last_failure_error`` grows a copy of itself every retry.
+        key = ln.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(ln)
+    return " ".join(lines)[-400:]
+
+
+def _infra_diagnostic(task_id: str, board: Optional[str] = None) -> "tuple[Optional[str], Optional[str]]":
+    """``(sanitized diagnostic, reason)`` for a provider-availability death, else ``(None, None)``.
+
+    ``reason`` is ``"provider_unavailable"`` (the provider says the model cannot
+    be served) or ``"quota_window"`` (a stated rate-limit reset). Both mean
+    "the rail is walled, nothing about the card ran", which the sweep books as
+    infra — never as a counted card failure.
+    """
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+    except Exception:
+        return (None, None)
+    if not raw:
+        return (None, None)
+    diagnostic = _sanitize_diagnostic(raw)
+    if not diagnostic:
+        return (None, None)
+    if _PROVIDER_UNAVAILABLE_SIGNATURE_RE.search(diagnostic):
+        return (diagnostic, "provider_unavailable")
+    if _QUOTA_WINDOW_SIGNATURE_RE.search(diagnostic):
+        return (diagnostic, "quota_window")
+    return (None, None)
+
+
+def _consecutive_infra_runs(conn: sqlite3.Connection, task_id: str) -> int:
+    """Newest-first count of consecutive ``infra`` runs, stopping at the first non-infra one.
+
+    Bounds the infra park: the streak says "this rail has now been unavailable N
+    spawns in a row", which is a rail condition, not N card defects.
+    """
+    streak = 0
+    for row in conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? "
+        "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 12",
+        (task_id,),
+    ):
+        if row["outcome"] != "infra":
+            break
+        streak += 1
+    return streak
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -1027,11 +1168,25 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    infra: bool = False
+    """The worker died on a provider/model availability wall (``_infra_diagnostic``).
+
+    Nothing about the card ran, so this is booked as its own neutral run outcome
+    (``"infra"``): ``consecutive_failures`` is untouched, the card is requeued
+    behind an infra cooldown, and only ``_INFRA_RAIL_MAX_CONSECUTIVE`` such runs
+    in a row park it with an explicit infra marker for the company lane.
+    """
+    infra_reason: Optional[str] = None
+    """``"provider_unavailable"`` | ``"quota_window"`` — carried onto the event."""
 
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
+        # doesn't show a phantom crash for a quota wall; a provider-availability
+        # death is ``infra`` for the same reason, and so the rail streak is
+        # countable (_consecutive_infra_runs).
+        if self.infra:
+            return "infra"
         return "rate_limited" if self.rate_limited else "crashed"
 
 
@@ -1040,11 +1195,31 @@ def _classify_dead_worker(
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
-    A clean exit or a crash carries the worker's own last output (``worker_output``
-    in the event payload, appended to the error text) so the board and the retry
-    worker see WHY instead of a bare label; a rate-limited requeue does not need it.
+    A provider/model availability signature in the worker's own log outranks the
+    exit-code booking: the same wall surfaces as 1, 75 or 78 depending on where
+    it was noticed, and the card is never the defective party. A clean exit or a
+    crash carries the worker's own last output (``worker_output`` in the event
+    payload, appended to the error text) so the board and the retry worker see
+    WHY instead of a bare label; a rate-limited requeue does not need it.
     """
     dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
+    if task_id and not dead.protocol_violation:
+        diagnostic, reason = _infra_diagnostic(task_id, board=board)
+        if reason is not None:
+            # Reclassify: the exit code said "card failed" (1/75/78); the worker's
+            # own log says "the rail is walled". The diagnostic is the sanitized
+            # provider text — never the raw TUI frame (see _sanitize_diagnostic).
+            dead.infra = True
+            dead.infra_reason = reason
+            dead.terminal_provider = False
+            dead.rate_limited = True
+            dead.error_text = (
+                f"pid {pid} exited on provider availability ({reason}) — booked as infra, "
+                f"the card's failure budget is untouched. Provider said: {diagnostic}"
+            )
+            dead.event_payload.pop("terminal_provider", None)
+            dead.event_payload.update({"infra": True, "infra_reason": reason, "diagnostic": diagnostic})
+            return dead
     if task_id and not dead.rate_limited:
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
@@ -1126,6 +1301,14 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    infra: list[str] = field(default_factory=list)
+    """Task ids whose worker died on a provider/model availability wall.
+
+    Neutral like ``rate_limited`` (no failure counted), but tracked apart so the
+    park-after-N-consecutive rule and the ``DispatchResult.infra`` bucket can see
+    them; ``infra_details`` carries the reason for the park decision."""
+    infra_details: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` for each infra reclaim in this tick."""
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1186,22 +1369,71 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.infra:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
                 # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
+                # board UI and retry worker need the corrective message. An infra
+                # death stamps the SANITIZED provider diagnostic (ANSI-stripped),
+                # never the scraped TUI frame.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
                 )
-            if dead.rate_limited:
+            if dead.infra:
+                sweep.infra.append(row["id"])
+                sweep.infra_details.append((row["id"], dead.infra_reason or "provider_unavailable"))
+                # Neutral: no failure row — an unavailable rail is not a card defect.
+            elif dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
     return sweep
+
+
+def _park_infra_rail(conn: sqlite3.Connection, task_id: str, reason: str) -> bool:
+    """Park a card whose rail has been unavailable ``_INFRA_RAIL_MAX_CONSECUTIVE`` spawns in a row.
+
+    Bounded respawn is the point: below the threshold an infra death requeues for
+    free (a quota window must not burn the card's budget), but a permanently
+    unavailable model/provider would otherwise respawn forever. The park goes
+    through the canonical :func:`kanban_db.block_task` with an explicit
+    ``infra`` marker on the event payload, so the block is STICKY (it survives
+    ``recompute_ready`` — a hand-rolled status flip plus a custom event kind
+    would be promoted straight back to ``ready`` next tick) and an operator can
+    release it with the ordinary ``kanban_unblock``.
+
+    ``consecutive_failures`` stays untouched: no attempt ever ran, so there is no
+    card defect to count. Must be called OUTSIDE the reclaim txn — ``block_task``
+    opens its own.
+
+    Returns True when the card was parked.
+    """
+    streak = _consecutive_infra_runs(conn, task_id)
+    if streak < _INFRA_RAIL_MAX_CONSECUTIVE:
+        return False
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["status"] not in ("running", "ready"):
+        # Only a live-claim/ready card is parkable; ``block_task`` refuses the
+        # rest anyway, and a parked card must not be re-parked every tick.
+        return False
+    reason_text = (
+        f"infra: {streak} consecutive provider-availability outcomes on this card's rail "
+        f"(latest: {reason}) — the model/provider is unavailable, the card itself never ran "
+        f"(consecutive_failures untouched). Fix the rail or reassign, then unblock to retry."
+    )
+    if not _kb.block_task(conn, task_id, reason=reason_text, kind="transient"):
+        return False
+    _kb._append_event(
+        conn, task_id, "infra_parked",
+        {
+            "infra": True, "infra_reason": reason, "infra_streak": streak,
+            "reason": "provider_rail_unavailable", "block_kind": "transient",
+        },
+    )
+    return True
 
 
 def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
@@ -1297,11 +1529,21 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    # Infra deaths count NO failure, so the counter-based breaker above cannot
+    # bound them: a permanently unavailable rail would respawn forever and a
+    # quota window would never surface. Park only past the streak threshold, and
+    # only AFTER the reclaim txn committed (``block_task`` opens its own txn).
+    infra_parked: list[str] = []
+    for infra_tid, infra_reason in sweep.infra_details:
+        if _park_infra_rail(conn, infra_tid, infra_reason):
+            infra_parked.append(infra_tid)
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # requeues did NOT count a failure and are NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_infra = sweep.infra  # type: ignore[attr-defined]
+    detect_crashed_workers._last_infra_parked = infra_parked  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1546,6 +1788,22 @@ def check_respawn_guard(
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
         # stamped rate-limit text; this path intentionally retries forever
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        return None
+    if latest_run is not None and latest_run["outcome"] == "infra":
+        # The worker died on a provider/model availability wall (see
+        # ``_infra_diagnostic``): nothing about the card ran, so it is NOT a card
+        # defect and must not be booked by ``blocker_auth`` below — the stamped
+        # diagnostic legitimately contains provider words like "quota" or
+        # "rate limit", which would otherwise trap a healthy card forever. Space
+        # the retries on the same cooldown as a quota wall; the streak-based
+        # ``_park_infra_rail`` is what bounds a permanently unavailable rail.
+        if rl_cooldown <= 0 or _consecutive_infra_runs(conn, task_id) >= _INFRA_RAIL_MAX_CONSECUTIVE:
+            # Cooldown disabled, or the park is (about to be) applied: don't
+            # defer, or the parked card would never surface to the operator.
+            return None
+        ended_at = latest_run["ended_at"]
+        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+            return "infra_cooldown"
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
@@ -2154,6 +2412,8 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    result.infra.extend(getattr(detect_crashed_workers, "_last_infra", []))
+    result.infra_parked.extend(getattr(detect_crashed_workers, "_last_infra_parked", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
