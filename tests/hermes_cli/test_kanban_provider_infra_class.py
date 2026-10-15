@@ -271,3 +271,112 @@ def test_three_consecutive_infra_outcomes_park_with_the_infra_marker(kanban_home
 
         # No phantom failure row either — the whole point of the class.
         assert conn.execute("SELECT consecutive_failures FROM tasks WHERE id=?", (tid,)).fetchone()[0] == 0
+
+
+# (e) BINDING fixture \u2014 an unstructured HTTP 403 stays UNRESOLVED, never infra
+# ---------------------------------------------------------------------------
+#
+# Company evidence comments 7074/7075/7077 on card t_226958da. The retained
+# provider message for fleet-ops/t_cdc58018 run 5164 (openai-codex/gpt-6.1-sol,
+# exit 78) is ``HTTP 403 \u2014 HTML error page (title not found)``: an UNSTRUCTURED
+# refusal whose precise cause is explicitly UNRESOLVED (the supported quota
+# endpoint answers; four profiles merely show the same cached auth-failed label,
+# which is one shared view, not proof of four broken accounts). Required end
+# state: a neutral nonretryable refusal with cause UNRESOLVED \u2014 no
+# invalid-credential assertion, no automatic retry, rotation or fallback, and the
+# confirmed auth/quota/billing controls intact. The provider-availability
+# classifier must therefore NOT swallow this shape on any exit code: turning an
+# unresolved provider wall into a free retry loop would be its own defect.
+_UNRESOLVED_403 = (
+    "openai-codex/gpt-6.1-sol\n"
+    "Attempt 1/3, not retryable ... HTTP 403 \u2014 HTML error page (title not found)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "rc", [1, kb.KANBAN_RATE_LIMIT_EXIT_CODE, kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE]
+)
+def test_unstructured_403_is_never_reclassified_as_a_walled_rail(kanban_home, rc):
+    """A bare HTML 403 is neither an unavailable rail nor proof of a bad key.
+
+    The infra class must not absorb it on any of the three codes the same wall
+    can surface as, and it must not invent a cause: the stored reason keeps the
+    provider's own words without an infrastructural verdict bolted on.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="403 wall", assignee="a")
+        _dead_worker(conn, tid, 77000 + rc, _UNRESOLVED_403, rc=rc)
+
+        kbd.detect_crashed_workers(conn)
+
+        run = _last_run(conn, tid)
+        md = kb._json_dict(run["metadata"])
+        assert run["outcome"] != "infra", f"rc={rc}: an unstructured 403 is not an infra rail"
+        assert md.get("infra") is None
+        assert md.get("infra_reason") is None
+        assert tid not in kbd.detect_crashed_workers._last_infra
+        assert tid not in kbd.detect_crashed_workers._last_infra_parked
+        # No infra streak was recorded, so nothing can park on this shape.
+        assert kbd._consecutive_infra_runs(conn, tid) == 0
+
+
+@pytest.mark.parametrize("rc", [1, kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE])
+def test_unstructured_403_provider_words_are_retained_verbatim(kanban_home, rc):
+    """The diagnosis must stay available to the operator.
+
+    On the paths that retain a diagnostic the provider's own sentence survives
+    into ``last_failure_error`` -- sanitized, but not paraphrased into a verdict.
+    (The exit-75 rate-limit path stamps only its own generic sentence; that
+    evidence gap is recorded in DEPLOY-NOTE.md, not asserted as correct here.)
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="403 wall words", assignee="a")
+        _dead_worker(conn, tid, 77500 + rc, _UNRESOLVED_403, rc=rc)
+
+        kbd.detect_crashed_workers(conn)
+
+        stored = conn.execute(
+            "SELECT last_failure_error FROM tasks WHERE id=?", (tid,)
+        ).fetchone()["last_failure_error"]
+        assert "HTTP 403" in stored, stored
+        assert "title not found" in stored, stored
+        # Sanitized: no raw TUI escape made it into the board-visible reason.
+        assert "\x1b" not in stored, repr(stored)
+
+
+def test_confirmed_auth_rejection_is_not_absorbed_by_the_infra_class(kanban_home):
+    """Control the ruling requires: an EXPLICIT invalid-credential rejection keeps
+    its own classification -- the infra class must not turn a real auth break into
+    a free retry loop."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="bad key", assignee="a")
+        _dead_worker(
+            conn, tid, 78000,
+            "openai-codex: Incorrect API key provided. Invalid API key (401 unauthorized).",
+        )
+
+        kbd.detect_crashed_workers(conn)
+
+        run = _last_run(conn, tid)
+        assert run["outcome"] != "infra", "a confirmed auth rejection is not an unavailable rail"
+        assert kb._json_dict(run["metadata"]).get("infra") is None
+        assert tid not in kbd.detect_crashed_workers._last_infra
+
+
+def test_confirmed_quota_window_still_classifies_as_infra_quota(kanban_home):
+    """Other half of the control pair: a provider-scoped quota window with a stated
+    reset remains the ``quota_window`` infra reason, and still costs no failure."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="quota control", assignee="a")
+        _dead_worker(
+            conn, tid, 79000,
+            "Provider said: rate limit exceeded for this model. limit resets at 12:00 UTC.",
+            rc=kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+        )
+
+        kbd.detect_crashed_workers(conn)
+
+        run = _last_run(conn, tid)
+        assert run["outcome"] == "infra"
+        assert kb._json_dict(run["metadata"]).get("infra_reason") == "quota_window"
+        assert kb.get_task(conn, tid).consecutive_failures == 0
