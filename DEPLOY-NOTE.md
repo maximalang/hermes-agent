@@ -1,13 +1,24 @@
 # DEPLOY-NOTE — provider/model-availability startup crashes are not card failures
 
-Card: `t_226958da` (fleet-ops). Branch: `task/t_226958da-provider-infra-class`.
+Card: `t_226958da` (fleet-ops). Branch: `task/t_226958da-provider-infra-class-main`.
 
-**Base: `9fcc6d0807fdb5c599cf345609c71cae1dcd549f`** (`fix/specify-task-type-marker-carry`,
-card t_08f6c9a3). Per the 2026-10-15 company serialization ruling this branch stacks on
-that tip instead of `5ce2c7d5aa1`; the earlier base is superseded. The deliverable
-cherry-picks onto the new base **conflict-free** (it touches no file the specify-path
-work owns) and the suite is green on both bases, so the change is base-agnostic.
-PR to `maximalang/hermes-agent`, **NOT merged** (body requirement).
+**Base as published: `5ce2c7d5aa1` (the repo default branch `main` tip).** The
+2026-10-15 company serialization ruling directs stacking this branch on the
+specify-path tip `9fcc6d0807fdb5c599cf345609c71cae1dcd549f`
+(`fix/specify-task-type-marker-carry`, card t_08f6c9a3) instead. That stack was built
+and verified in full — cherry-pick **conflict-free**, suite green (16 passed) — and is
+published as **PR #9** against a dedicated `base/9fcc6d0807f-provider-infra` branch, so
+the ruling is delivered and reviewable. It cannot be the *completion-contract* base
+here: the board's PR acceptance requires the PR base to be the repository **default
+branch**, and a PR from `base/9fcc6d0807f-provider-infra` is rejected
+(`PR acceptance base_mismatch`). The kernel-compliant PR is therefore cut from `main`
+with the identical diff, and the stacked PR #9 is left open as the ruling's artifact.
+Both are **NOT merged** (body requirement).
+
+Practical consequence for the reviewer: the two PRs carry the **same three-file diff**
+(842 insertions / 7 deletions). Merging the `main`-based one is the contract path; the
+stacked one exists to satisfy the serialization ruling and to prove the specify-path
+collision is clean.
 
 ## Problem
 
