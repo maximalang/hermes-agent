@@ -1063,6 +1063,12 @@ class GatewayAdapterLifecycleMixin:
             if owns_host_lock(ROLE_GATEWAY):
                 from hermes_constants import get_hermes_home
                 publish_record(ROLE_GATEWAY, profiles=tuple(served), home=str(get_hermes_home()))
+                # Sentinel contract §5.2: the freshly loaded process is the one witness that can
+                # confirm a restart — once it owns the host lock and serves the fleet, it stamps
+                # the host update-restart obligation it booted for (no-op when nothing is armed),
+                # settling the "previous update was not restarted" warning on every restart path.
+                from hermes_cli.update_host_obligation import stamp_gateway_boot_restart
+                stamp_gateway_boot_restart()
 
     async def _load_secondary_profile_config(self, profile_name: str, profile_home: Path):
         """Hydrate + enter ``profile_home``'s scope once; return its gateway config. Raises

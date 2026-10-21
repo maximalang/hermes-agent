@@ -45,6 +45,12 @@ HOST_OBLIGATION_NAME = "host-update-restart.json"
 #: The per-``HERMES_HOME`` breadcrumb an unwritable host record falls back to; every reader honours it.
 PROFILE_MARKER_NAME = "fleet_restart_pending"
 
+#: The ``restart_in_flight`` window: how long after an executor stops the old process a
+#: successor may still be loading before readers treat the restart as failed. Mirrors the
+#: detached watcher's own wait (``gateway.GATEWAY_RESTART_WATCHER_TIMEOUT_S``) plus spawn
+#: margin; executors with a better budget pass theirs (sentinel contract §5.4 race 1).
+RESTART_FLIGHT_WATCH_BUDGET_S = 150.0
+
 _RECORD_VERSION = 1
 
 
@@ -205,6 +211,13 @@ def _mode(path: Path, probe: Callable[[Path], os.stat_result]) -> int:
 
 
 def _write_locked(path: Path, *, expected_sha: str, runtimes: Optional[list], profile: str, owner: str) -> bool:
+    if runtimes and not (expected_sha or "").strip():
+        # Sentinel-contract invariant: an inventoried record must not be armed with an empty SHA —
+        # it names an owed set no code identity can ever prove current, so its warning could never
+        # clear (#125952's class, armed WITH an inventory). Keep the debt, drop the set: the
+        # SHA-less record still discharges when every live gateway runs the checkout's code.
+        logger.debug("Arming the update-restart obligation without an inventory: no SHA names the owed code")
+        runtimes = None
     existing = _read_record(path)
     try:
         found = _baseline_for(owner, existing, path) if owner else None
@@ -410,11 +423,135 @@ def obligation_fields() -> Optional[dict[str, str]]:
     return fields
 
 
-def mark_host_restart_completed(sha: str) -> None:
-    """Record that the host process was restarted onto ``sha``. Never raises."""
-    _update_record(
-        lambda record: record.update(restarted={"sha": sha or "", "pid": os.getpid(), "at": time.time()}),
-        "stamp restart completion on")
+def mark_host_restart_completed(
+    sha: str, *, pid: Optional[int] = None, start_time: Optional[float] = None,
+    confirmed: Iterable[str] = (), by: str = "",
+) -> None:
+    """Record that the host process was restarted onto ``sha``. Never raises.
+
+    The stamp is the positive "restart done" evidence readers honour first: written by the
+    update's restart phase and by the freshly loaded gateway process itself
+    (:func:`stamp_gateway_boot_restart`) — the one witness that can hold the confirmation
+    criteria — never by a stop that did not respawn. A record armed for a DIFFERENT SHA is
+    never stamped (arm-vs-stamp-vs-release race: the stamp validates ``expected_sha`` under
+    the record mutex), and stamping clears any standing in-flight descriptor: the successor
+    it described has arrived.
+    """
+    target = str(sha or "")
+    stamp: dict[str, Any] = {
+        "sha": target,
+        "pid": os.getpid() if pid is None else int(pid),
+        "at": time.time(),
+    }
+    if start_time is not None:
+        stamp["start_time"] = start_time
+    proofs = [str(proof) for proof in confirmed if proof]
+    if proofs:
+        stamp["confirmed"] = proofs
+    if by:
+        stamp["by"] = by
+
+    def _change(record: dict) -> None:
+        owed_sha = str(record.get("expected_sha") or "")
+        if owed_sha and target and owed_sha != target:
+            return  # re-armed for a newer pull: this restart is not that debt's proof
+        record.pop("restart_in_flight", None)
+        record["restarted"] = stamp
+
+    _update_record(_change, "stamp restart completion on")
+
+
+def stamp_gateway_boot_restart(*, confirmed: Iterable[str] = ("gateway-boot",)) -> bool:
+    """The running gateway process stamps the record: it IS the confirmed restart.
+
+    Every restart path ends here — manual ``gateway restart``, the detached watcher's respawn,
+    a service manager's unit, an external supervisor — because only the freshly loaded process
+    proves the criteria: it is alive, serving, and its tree is the code the restart was for.
+    Called once the host lock is held and the served set is recorded; no-op (False) when
+    nothing is armed or the running code's SHA cannot be named. Never raises.
+    """
+    if not host_obligation_present():
+        return False
+    try:
+        from hermes_cli.version_info import get_code_identity
+        sha = (get_code_identity() or {}).get("sha")
+    except Exception as exc:  # health: allow BLE001 -- a boot hook never raises
+        logger.debug("Could not resolve the running code identity for the boot stamp: %s", exc)
+        return False
+    if not sha:
+        return False
+    start_time = None
+    try:  # process_identity pulls ``utils``; fine in a booted gateway, kept out of module import
+        from hermes_cli.process_identity import _process_create_time
+        start_time = _process_create_time()
+    except Exception as exc:  # health: allow BLE001 -- the stamp stands without the fingerprint
+        logger.debug("Could not resolve this process's start time for the boot stamp: %s", exc)
+    mark_host_restart_completed(str(sha), pid=os.getpid(), start_time=start_time,
+                                confirmed=confirmed, by="gateway-boot")
+    return True
+
+
+def begin_host_restart_flight(
+    *, target_sha: str, old_pid: int = 0, old_start_time: Optional[float] = None,
+    watcher: str = "", watch_budget_s: Optional[float] = None,
+) -> bool:
+    """Record RESTART_IN_FLIGHT: an executor is stopping the old host process now. Never raises.
+
+    The armed record gains a transient ``restart_in_flight`` descriptor — the target SHA, the
+    old process's identity, which executor is acting, and a deadline — so a CLI that starts
+    inside the stop→respawn window reads "restart in progress" instead of "previous update was
+    not restarted" (sentinel contract §5.4 race 1). Past the deadline with no stamped successor
+    readers treat the restart as failed and keep the warning. No standing record means nothing
+    is owed: False, and no state dir is created.
+    """
+    if not target_sha:
+        return False
+    now = time.time()
+    budget = RESTART_FLIGHT_WATCH_BUDGET_S
+    if watch_budget_s is not None and watch_budget_s > 0:
+        budget = float(watch_budget_s)
+    flight = {
+        "target_sha": str(target_sha),
+        "old_pid": int(old_pid or 0),
+        "old_start_time": old_start_time,
+        "watcher": watcher or "",
+        "at": now,
+        "deadline": now + budget,
+    }
+    path = _owed_path()
+    if _read_record(path) is None:
+        return False
+    try:
+        with _record_mutex(path):
+            record = _read_record(path)
+            if record is None:
+                return False
+            record["restart_in_flight"] = flight
+            _write_record(path, record)
+            return True
+    except Exception as exc:  # health: allow BLE001 -- never raises: the warning just stays loud
+        logger.debug("Could not record the in-flight host gateway restart: %s", exc)
+        return False
+
+
+def host_restart_in_flight(*, now: Optional[float] = None) -> Optional[dict]:
+    """The standing ``restart_in_flight`` descriptor, or ``None``. Never raises.
+
+    The returned copy carries ``expired``: a descriptor past its deadline describes a restart
+    that never produced a confirmed successor — readers keep the warning there (fail-closed)
+    and only soften it inside the window.
+    """
+    record = read_host_obligation()
+    flight = record.get("restart_in_flight") if isinstance(record, dict) else None
+    if not isinstance(flight, dict):
+        return None
+    try:
+        deadline = float(flight.get("deadline") or 0.0)
+    except (TypeError, ValueError):
+        deadline = 0.0
+    out = dict(flight)
+    out["expired"] = (time.time() if now is None else now) > deadline
+    return out
 
 
 def _update_record(change: Callable[[dict], None], what: str) -> None:
@@ -434,18 +571,37 @@ def _update_record(change: Callable[[dict], None], what: str) -> None:
         logger.debug("Could not %s host update-restart obligation: %s", what, exc)
 
 
-def host_restart_already_completed(sha: Optional[str]) -> bool:
+def host_restart_already_completed(
+    sha: Optional[str], *, pid: Optional[int] = None, start_time: Optional[float] = None,
+) -> bool:
     """True when THIS host obligation was already restarted onto ``sha``.
 
     The guard that makes the catch-up restart idempotent per host: a second profile running
     ``hermes update`` must attach to the first restart's outcome, never kill the shared
-    multiplexer again.
+    multiplexer again. ``pid``/``start_time`` (optional) narrow the proof to one successor
+    process — a stamp for a different incarnation of the gateway is not the restart in
+    question (start-time fingerprint at ``gateway.status.start_time_fingerprints_match``'s
+    tolerance, compared locally so this module stays import-light).
     """
     record = read_host_obligation()
     if record is None or not sha:
         return False
     restarted = record.get("restarted")
-    return isinstance(restarted, dict) and str(restarted.get("sha") or "") == sha
+    if not (isinstance(restarted, dict) and str(restarted.get("sha") or "") == str(sha)):
+        return False
+    if pid is not None and restarted.get("pid") is not None:
+        try:
+            if int(restarted.get("pid")) != int(pid):
+                return False
+        except (TypeError, ValueError):
+            return False
+    if start_time is not None and restarted.get("start_time") is not None:
+        try:
+            if abs(float(restarted.get("start_time")) - float(start_time)) > 1.0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 def collapse_units_to_host_processes(

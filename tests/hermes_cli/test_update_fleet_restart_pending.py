@@ -737,25 +737,32 @@ def test_startup_warn_kept_when_inventory_holds_unclassified_serve(monkeypatch, 
 
 
 @pytest.mark.parametrize(
-    "disk_sha, fleet",
+    "disk_sha, fleet, expected",
     [
-        ("e" * 40, [{"profile": "default", "pid": 42, "code_sha": "7" * 40, "code_version": "0.20.0", "state": "stale"}]),
-        ("e" * 40, []),  # probe answered empty: no proof either way
-        ("e" * 40, [{"profile": "default", "pid": 42, "code_sha": None, "code_version": None, "state": "unknown"}]),
-        (None, [{"profile": "default", "code_sha": "e" * 40, "state": "current"}]),
+        ("e" * 40, [{"profile": "default", "pid": 42, "code_sha": "7" * 40, "code_version": "0.20.0", "state": "stale"}],
+         "did not restart running gateways"),
+        ("e" * 40, [], "did not restart running gateways"),  # probe answered empty: no proof either way
+        ("e" * 40, [{"profile": "default", "pid": 42, "code_sha": None, "code_version": None, "state": "unknown"}],
+         "cannot be verified (a running gateway's identity could not be established)"),
+        (None, [{"profile": "default", "code_sha": "e" * 40, "state": "current"}],
+         "did not restart running gateways"),
         # checkout moved to a commit unrelated to the marker's SHA: a newer pull owns a fresh obligation
-        ("f" * 40, [{"profile": "default", "pid": 42, "code_sha": "e" * 40, "code_version": None, "state": "current"}]),
+        ("f" * 40, [{"profile": "default", "pid": 42, "code_sha": "e" * 40, "code_version": None, "state": "current"}],
+         "cannot be verified (the checkout moved past the update's SHA)"),
     ],
     ids=["stale-row", "empty-probe", "unknown-identity", "unknown-checkout", "checkout-moved"],
 )
-def test_startup_warn_kept_without_positive_evidence(monkeypatch, capsys, disk_sha, fleet):
+def test_startup_warn_kept_without_positive_evidence(monkeypatch, capsys, disk_sha, fleet, expected):
     update_cmd._write_fleet_restart_pending_marker(expected_sha="e" * 40, runtimes=[{"kind": "gateway", "profile": "default"}])
     _patch_marker_sha(monkeypatch, disk_sha)
     monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", lambda **kwargs: fleet)
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    # Sentinel contract §5.6: unverifiable state names WHAT could not be verified; a provable
+    # restart debt keeps the mixed-modules certainty.
+    assert "⚠" in err and expected in err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 
@@ -1088,8 +1095,13 @@ def test_second_profile_attaches_to_completed_host_restart(monkeypatch):
     host_obligation.mark_host_restart_completed("abc123")
     assert update_cmd_fleet._fleet_restart_skip_reason(None)
 
-    # A stamp for other code proves nothing about this checkout.
+    # Sentinel contract race (arm vs stamp vs release): a restart onto OTHER code is not this
+    # record's proof, and it must not ERASE the proof that matched either — the stamp validates
+    # ``expected_sha`` under the record mutex and is simply refused.
     host_obligation.mark_host_restart_completed("def456")
+    assert update_cmd_fleet._fleet_restart_skip_reason(None)
+    # Only a re-arm for newer code starts a debt without proof again.
+    update_cmd._write_fleet_restart_pending_marker(expected_sha="def456")
     assert update_cmd_fleet._fleet_restart_skip_reason(None) is None
 
 

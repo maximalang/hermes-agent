@@ -379,6 +379,7 @@ def _marker_only_restart_obsolete() -> bool:
     phase never touched it — this marker only stops re-warning about it on every later startup.
     """
     from hermes_cli.update_cmd_fleet_checkout import checkout_contains
+    from hermes_cli.update_host_obligation import host_restart_already_completed
 
     try:
         fields = _obligation_fields()
@@ -388,6 +389,15 @@ def _marker_only_restart_obsolete() -> bool:
         owed = _marker_owed_gateways(json.loads(fields.get("inventory", "null")))
     except (OSError, UnicodeError, ValueError):
         return False
+    if expected_sha and host_restart_already_completed(expected_sha):
+        # The restart this record owes was confirmed by the process that performed it — the
+        # stamped successor outranks any live re-probe, which a stop→respawn window or a
+        # foreign state-file writer can turn fail-closed forever (sentinel contract §5.3:
+        # readers honour the stamp first; a stamp for a DIFFERENT sha proves nothing here).
+        _clear_fleet_restart_pending_marker()
+        logger.debug("Fleet-restart-pending marker discharged: restart onto %s was recorded",
+                     expected_sha[:10])
+        return True
     if owed is not None and not owed:
         # A pull that recorded no gateway runtime owes no restart; clearing avoids the
         # stuck "Fleet restart incomplete" loop on Desktop-hosted (no-service) installs.
@@ -405,6 +415,14 @@ def _marker_only_restart_obsolete() -> bool:
     target_sha = checkout_sha
     if not target_sha:
         return False
+    if host_restart_already_completed(target_sha):
+        # A SHA-less record (pre-inventory writer, #125952) whose restart was stamped at the
+        # checkout the successor booted from: the loaded process is the whole proof there
+        # ever was, so no live probe is owed (sentinel contract §5.3).
+        _clear_fleet_restart_pending_marker()
+        logger.debug("Fleet-restart-pending marker discharged: restart onto %s was recorded",
+                     target_sha[:10])
+        return True
     try:
         from hermes_cli.update_receipt import collect_fleet_versions, row_is_external
         fleet = collect_fleet_versions()
@@ -494,13 +512,76 @@ def _update_owes_fleet_restart(*, receipt: dict | None = None, pending_manual: l
     return not _live_fleet_covers_receipt(_current_checkout_sha(), receipt, owed)
 
 
-def _warn_pending_fleet_restart(*, startup: bool = False) -> None:
+def _warn_pending_fleet_restart(*, startup: bool = False, reason: str | None = None) -> None:
     """Print the specific interrupted-update fleet-restart warning."""
     stream = sys.stderr if startup else sys.stdout
+    if reason:
+        # Sentinel contract §5.6: state that cannot be VERIFIED is not state that IS mixed —
+        # name what failed so the operator learns what to fix instead of a false certainty.
+        print(f"⚠ A previous update's restart state cannot be verified ({reason}).", file=stream)
+        print("  Run `hermes update` or `hermes gateway restart` to settle it.", file=stream)
+        return
     print("⚠ A previous `hermes update` pulled new code but did not restart running gateways.", file=stream)
     print("  Gateways may still be serving pre-update modules (mixed sys.modules).", file=stream)
     if startup:
         print("  Run `hermes update` or `hermes gateway restart`.", file=stream)
+
+
+def _fleet_restart_in_flight_fresh() -> bool:
+    """True while a recorded restart is inside its stop→respawn window. Never raises.
+
+    Sentinel contract §5.4 race 1: inside the window no probe can say anything honest — the
+    old process may still be draining while its replacement loads — so readers soften the
+    pending-update warning to a one-liner instead of the mixed-modules certainty.
+    """
+    from hermes_cli.update_host_obligation import host_restart_in_flight
+    with suppress(Exception):
+        flight = host_restart_in_flight()
+        return bool(flight) and not flight.get("expired")
+    return False
+
+
+def _unverified_fleet_restart_reason() -> str | None:
+    """Why the ARMED obligation cannot be verified, or ``None`` when its terms are readable.
+
+    Mirrors ``_marker_only_restart_obsolete``'s fail-closed branches without its side effects:
+    this only names the reason for the distinct warning text (§5.6) — it never clears,
+    discharges or probes-once-more. Only the sentinel contract's narrow vectors get the
+    distinct text (unreadable record, moved HEAD, unknown-identity runtime); a stale/down
+    row with a known identity, an empty probe or an unsupported inventory is a genuine
+    restart debt and keeps the battle-tested mixed-modules text.
+    """
+    from hermes_cli.update_cmd_fleet_checkout import checkout_contains
+
+    try:
+        fields = _obligation_fields()
+        if fields is None:
+            return "the pending-restart record is unreadable"
+        expected_sha = fields.get("expected_sha", "").strip()
+        owed = _marker_owed_gateways(json.loads(fields.get("inventory", "null")))
+    except (OSError, UnicodeError):
+        return "the pending-restart record is unreadable"
+    except ValueError:
+        return None  # unsupported inventory terms: the fail-closed debt text applies
+    if owed is not None and not expected_sha:
+        return "the pending-restart record names no code SHA"
+    if owed is not None:
+        checkout_sha = _current_checkout_sha()
+        if checkout_sha and checkout_sha != expected_sha and not checkout_contains(expected_sha):
+            return "the checkout moved past the update's SHA"
+    try:
+        from hermes_cli.update_receipt import collect_fleet_versions, row_is_external
+        fleet = collect_fleet_versions()
+    except Exception:
+        return None  # transient probe failure: the debt text applies, not a verdict
+    if fleet and (
+        _fleet_covered_gateways(fleet) is None
+        or any(isinstance(row, dict) and not row_is_external(row)
+               and (row.get("state") == "unknown" or not row.get("code_sha")) for row in fleet)
+    ):
+        # The discharge gate's unknown-identity row: what it runs cannot even be named.
+        return "a running gateway's identity could not be established"
+    return None
 
 
 def _warn_pending_fleet_restart_on_startup() -> None:
@@ -514,7 +595,15 @@ def _warn_pending_fleet_restart_on_startup() -> None:
         pending_manual = retain_receipt_manual_serves(receipt)
     with suppress(Exception):
         if _update_owes_fleet_restart(receipt=receipt, pending_manual=pending_manual):
-            _warn_pending_fleet_restart(startup=True)
+            if _fleet_restart_in_flight_fresh():
+                # A restart executor is inside its stop→respawn window: the probe cannot say
+                # anything honest yet, so soften to a one-liner for the window's lifetime.
+                print("ℹ A host gateway restart is in progress; the pending-update check resumes after it.",
+                      file=sys.stderr)
+            elif _fleet_restart_obligation_armed():
+                _warn_pending_fleet_restart(startup=True, reason=_unverified_fleet_restart_reason())
+            else:
+                _warn_pending_fleet_restart(startup=True)
     with suppress(Exception):
         warn_pending_manual_serves(startup=True, pending_manual=pending_manual)
 

@@ -1058,12 +1058,51 @@ def _host_gateway_watcher_env() -> dict[str, str]:
     return env
 
 
+def _begin_host_restart_flight(watcher: str, old_pid: int | None = None) -> None:
+    """Tell the host update-restart obligation a restart is stopping the old process now.
+
+    Sentinel contract §5: the executor records RESTART_IN_FLIGHT (target = the code being
+    restarted onto, the old process's identity, the watch budget) before any path below can
+    stop the old process; the freshly loaded gateway stamps the completion when it boots
+    (``update_host_obligation.stamp_gateway_boot_restart``). Best-effort by design: a lost
+    descriptor only keeps the pending-update warning loud through the window, it never
+    wrongly silences one.
+    """
+    try:
+        from hermes_cli.update_host_obligation import begin_host_restart_flight
+        from hermes_cli.version_info import get_code_identity
+        sha = (get_code_identity(refresh=True) or {}).get("sha")
+        if not sha:
+            return
+        pid = old_pid
+        if not pid:
+            with contextlib.suppress(Exception):
+                from gateway.status import get_running_pid
+                pid = get_running_pid()
+        if not pid:
+            # Nothing is being stopped, so there is no stop→respawn window to announce —
+            # the boot stamp of whatever starts next settles the record on its own.
+            return
+        start_time = None
+        with contextlib.suppress(Exception):
+            from gateway.host_rendezvous import process_create_time
+            start_time = process_create_time(pid)
+        begin_host_restart_flight(target_sha=str(sha), old_pid=pid or 0,
+                                  old_start_time=start_time, watcher=watcher)
+    except Exception as exc:  # health: allow BLE001 -- never raises from a restart executor
+        logger.debug("Could not record the in-flight gateway restart (%s): %s", watcher, exc)
+
+
 def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: bool | None = None, home: str | None = None) -> bool:
     """Spawn the detached watcher that respawns ``run_argv`` once ``old_pid`` exits. Watcher and respawn
     both need platform-appropriate detach: POSIX setsid; on Windows ``start_new_session`` does NOT detach
     (the watcher would die with the CLI console), so ``windows_detach_popen_kwargs()`` supplies flags."""
     if old_pid <= 0 or not run_argv:
         return False
+    # Sentinel contract §5.3: the detached watcher IS a restart executor — announce the
+    # stop→respawn window before the old process is asked to exit, so a CLI that starts
+    # inside it reads "restart in progress", not a false stale-update warning.
+    _begin_host_restart_flight("detached-watcher", old_pid=old_pid)
     from hermes_cli._subprocess_compat import windows_detach_flags_without_breakaway, windows_detach_popen_kwargs
 
     # Windows: ``run_argv`` leads with the venv's console ``python.exe`` — the interpreter we want:
@@ -5350,6 +5389,10 @@ def _cmd_stop(args):
         sys.exit(GATEWAY_FATAL_CONFIG_EXIT_CODE)
     from hermes_cli.gateway_lifecycle_guards import refuse_while_sessions_live
     refuse_while_sessions_live("stop", args)
+    # Sentinel contract §5.3: `gateway stop` ends the process a later `gateway start`/supervisor
+    # respawn replaces, so the window opens here too; if nothing respawns, its deadline expiry
+    # returns the pending-update warning (fail-closed).
+    _begin_host_restart_flight("gateway-stop")
     # Under s6 a bare pkill is seen as a crash and restarted; go through the supervisor.
     if stop_all and _dispatch_all_via_service_manager_if_s6("stop"):
         return
@@ -5466,6 +5509,10 @@ def _cmd_restart(args):
         _guard_named_profile_under_multiplexer(force=force)
     from hermes_cli.gateway_lifecycle_guards import refuse_while_sessions_live
     refuse_while_sessions_live("restart", args)
+    # Sentinel contract §5.3: from here every path restarts (service manager, external-supervisor
+    # hand-back, manual fallback), so the stop→respawn window opens now — before any of them
+    # can stop the old process.
+    _begin_host_restart_flight("gateway-restart")
     if restart_all and _dispatch_all_via_service_manager_if_s6("restart"):
         return
     if not restart_all and _dispatch_via_service_manager_if_s6("restart"):
