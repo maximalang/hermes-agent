@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 from contextlib import closing
 from dataclasses import asdict, replace
+import os
 import threading
 import json
 from pathlib import Path
@@ -145,19 +146,13 @@ async def run_task(connection, params):
     return {'session_id': ref.session_id, 'receipt': asdict(receipt)}
 
 
-def bind_worker_context(frame):
-    """Only the adopted private exec calls this, before tool discovery imports."""
-    import os
-    context = json.loads(frame['policy'].get('kanban_json') or 'null')
-    if context is None:
-        return
-    if frame['policy']['source'] != 'kanban':
-        raise ValueError('invalid_kanban_policy')
+def _kanban_worker_env(context):
+    """The frame-derived env every Kanban worker runs its turns under (pure: no DB reads)."""
     env = {'HERMES_KANBAN_TASK': context['task_id'], 'HERMES_KANBAN_BOARD': context['board'],
         'HERMES_KANBAN_DB': context['db'], 'HERMES_KANBAN_RUN_ID': str(context['run_id']),
         'HERMES_KANBAN_CLAIM_LOCK': context['claim_lock'], 'HERMES_KANBAN_WORKSPACE': context['workspace'],
-        'HERMES_KANBAN_WORKSPACES_ROOT': context['workspaces_root'], 'HERMES_PROFILE': context['profile'],
-        'HERMES_SESSION_SOURCE': 'kanban'}
+        'HERMES_KANBAN_WORKSPACES_ROOT': context['workspaces_root'],
+        'HERMES_PROFILE': context['profile'], 'HERMES_SESSION_SOURCE': 'kanban'}
     for key, value in (('HERMES_KANBAN_BRANCH', context['branch']), ('HERMES_TENANT', context['tenant'])):
         if value:
             env[key] = value
@@ -168,6 +163,35 @@ def bind_worker_context(frame):
         value = _worker_terminal_timeout_env(context['max_runtime_seconds'], os.environ.get(key))
         if value:
             env[key] = value
+    return env
+
+
+def prebind_worker_context(frame):
+    """Earliest possible liveness binding for a Kanban managed worker: env pins, the workspace
+    chdir and the submitter watch, all from the frame alone, BEFORE the heavy import chain
+    (runtime store → providers → openai → numpy) that wedged startup zombies (2026-10-21).
+    The watch used to start only inside ``bind_worker_context``, after those imports, so a
+    child hung mid-import ignored its submitter's death. No DB reads here: the trusted claim
+    check and the ``worker_bound`` write stay in ``bind_worker_context``, after adopt."""
+    import os
+    context = json.loads(frame['policy'].get('kanban_json') or 'null')
+    if context is None:
+        return
+    if frame['policy']['source'] != 'kanban':
+        raise ValueError('invalid_kanban_policy')
+    _watch_submitter(Path(context['db']), context['run_id'])
+    os.environ.update(_kanban_worker_env(context))
+    os.chdir(context['workspace'])
+
+
+def bind_worker_context(frame):
+    """Only the adopted private exec calls this, before tool discovery imports."""
+    import os
+    context = json.loads(frame['policy'].get('kanban_json') or 'null')
+    if context is None:
+        return
+    if frame['policy']['source'] != 'kanban':
+        raise ValueError('invalid_kanban_policy')
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli import kanban_db as kb
     with connect_closing(Path(context['db'])) as conn:
@@ -189,10 +213,7 @@ def bind_worker_context(frame):
     # inherited it from the dispatcher's environment); this daemon's own default is not that.
     expires = json.loads(claimed[0]).get('expires') if claimed else None
     if isinstance(expires, int) and claimed[1]:
-        env['HERMES_KANBAN_CLAIM_TTL_SECONDS'] = str(max(1, expires - int(claimed[1])))
-    _watch_submitter(Path(context['db']), context['run_id'])
-    os.environ.update(env)
-    os.chdir(context['workspace'])
+        os.environ['HERMES_KANBAN_CLAIM_TTL_SECONDS'] = str(max(1, expires - int(claimed[1])))
 
 
 _TURNS_DONE = threading.Event()
@@ -207,11 +228,18 @@ def _watch_submitter(db, run_id):
     from hermes_cli.kanban_db_dispatch import _worker_alive
 
     def watch():
+        blind_ticks = 0
         with closing(sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
             while not _TURNS_DONE.wait(1.0):
                 try:
                     row = conn.execute('SELECT worker_pid, worker_started_at FROM task_runs WHERE id=?', (run_id,)).fetchone()
+                    blind_ticks = 0
                 except sqlite3.Error:
+                    # A board unreadable for longer than any claim TTL blinds the watch: the
+                    # submitter may already be gone. Exit instead of guarding a dead attempt.
+                    blind_ticks += 1
+                    if blind_ticks > 600:
+                        os._exit(1)
                     continue
                 if row and row[0] and row[0] != os.getpid() and not _worker_alive(row[0], row[1]):
                     os._exit(1)

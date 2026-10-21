@@ -2145,14 +2145,20 @@ def _claim_and_open_run(
     *, event_extra: Optional[dict] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
+    when the CAS lost. Caller holds the txn.
+
+    ``last_heartbeat_at`` is scrubbed here — the single claim point — because not every
+    release path does it (an operator ``reclaim_task`` keeps the old value): a new attempt
+    inheriting a stale heartbeat looks instantly stale to the TTL reaper and dies ~one
+    stale-timeout after spawn (2026-10-21 reclaim loop)."""
     cur = conn.execute(
         f"""
         UPDATE tasks
            SET status        = 'running',
                claim_lock    = ?,
                claim_expires = ?,
-               started_at    = COALESCE(started_at, ?)
+               started_at    = COALESCE(started_at, ?),
+               last_heartbeat_at = NULL
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
@@ -2513,11 +2519,15 @@ def reclaim_task(
         )
         if cur.rowcount != 1:
             return False
-        _record_reclaim(
+        run_id = _record_reclaim(
             conn, task_id, termination,
             error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
             payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status},
         )
+    # The run's bound interpreter is a separate tree from the submitter terminated above:
+    # a gateway-managed child wedged in startup ignores the submitter's death (2026-10-21).
+    from hermes_cli.kanban_db_dispatch import _signal_bound_interpreter
+    _signal_bound_interpreter(conn, task_id, run_id)
     # Operator intervention = fresh retry budget (own txn, runs after commit).
     _clear_failure_counter(conn, task_id)
     return True
