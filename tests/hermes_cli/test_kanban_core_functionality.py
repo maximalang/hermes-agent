@@ -411,6 +411,7 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         kb.claim_task(conn, tid)
         run1 = kb.latest_run(conn, tid)
         kbd._set_worker_pid(conn, tid, 98765)
+        assert kbd.heartbeat_worker(conn, tid, note="run1 alive", expected_run_id=run1.id)
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kbd.detect_crashed_workers(conn) == [tid]
 
@@ -428,6 +429,31 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         assert kbd.heartbeat_worker(conn, tid, note="current", expected_run_id=run2.id)
         assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id)
         assert kb.get_task(conn, tid).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_new_claim_never_inherits_prior_attempt_heartbeat(kanban_home):
+    """A fresh claim starts with a clean liveness clock (2026-10-21 zombie/reclaim loop):
+    ``reclaim_task`` releases the claim without touching ``tasks.last_heartbeat_at``, so a
+    re-claimed run that inherits a stale heartbeat looks instantly stale to the TTL reaper
+    (the ~920 s reclaim loop on retry). The atomic claim is the single point that must reset
+    it, whichever path released the previous attempt."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="claim resets heartbeat", assignee="worker")
+        kb.claim_task(conn, tid)
+        run1 = kb.latest_run(conn, tid)
+        assert kbd.heartbeat_worker(conn, tid, note="alive", expected_run_id=run1.id)
+        assert kb.reclaim_task(conn, tid, reason="operator") is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.last_heartbeat_at is not None  # reclaim itself does not scrub it
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.current_run_id != run1.id
+        assert task.last_heartbeat_at is None  # the new attempt owns a clean clock
     finally:
         conn.close()
 

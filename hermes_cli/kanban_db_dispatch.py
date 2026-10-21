@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -498,6 +499,41 @@ def _terminate_reclaimed_worker(
     return info
 
 
+def _signal_bound_interpreter(
+    conn: sqlite3.Connection, task_id: str, run_id, *, signal_fn=None,
+) -> dict[str, Any]:
+    """Best-effort termination of the run's BOUND interpreter — the gateway-managed worker
+    that recorded itself via ``worker_bound`` (pid + spawn fingerprint). The dispatcher's
+    spawned submitter is a different process tree: killing it alone left the gateway child
+    alive as a zombie when the child had wedged in startup before its own submitter-watch
+    began (2026-10-21). Keys on the LATEST ``worker_bound`` of THIS run only, so a recycled
+    or unverified pid is never signalled; empty dict when the run never bound one."""
+    info: dict[str, Any] = {}
+    if not run_id:
+        return info
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'worker_bound' "
+        "ORDER BY id DESC LIMIT 1", (task_id, run_id),
+    ).fetchone()
+    if row is None:
+        return info
+    try:
+        payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else dict(row["payload"])
+    except (TypeError, ValueError):
+        return info
+    pid = payload.get("pid")
+    if not pid:
+        return info
+    termination = _terminate_reclaimed_worker(
+        int(pid), payload.get("claim_lock") or "", signal_fn=signal_fn,
+        started_at=payload.get("started_at"))
+    if termination.get("termination_attempted"):
+        _kb._log.info(
+            "kanban: reclaim signalled task %s bound interpreter pid %s (terminated=%s sigkill=%s)",
+            task_id, pid, termination.get("terminated"), termination.get("sigkill"))
+    return termination
+
+
 def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
     """End host-local workers that outlived their run (issue #111791) — a worker
     that called ``kanban_complete`` and then hung keeps its ``state.db`` sidecar
@@ -848,6 +884,10 @@ def detect_stale_running(
             )
             _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
             reclaimed.append(tid)
+        # Outside the release txn (signalling polls for exit; never hold the writer lock for
+        # that): the bound gateway-managed interpreter is a separate tree from the submitter
+        # above — a child wedged before its watch started ignored the submitter's death.
+        _signal_bound_interpreter(conn, tid, run_id, signal_fn=signal_fn)
 
     return reclaimed
 

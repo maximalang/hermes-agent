@@ -322,6 +322,10 @@ def tool_frame(call_id, name, args, *result):
 
 
 def execute(frame, channel):
+    # Kanban liveness first: the submitter watch must exist BEFORE any heavy import below can
+    # wedge the interpreter (2026-10-21 startup zombies hung in numpy import with no watchdog).
+    from gateway.session_kanban import prebind_worker_context
+    prebind_worker_context(frame)
     # The owner RPC below imports gateway/config modules (hermes_cli.config, providers,
     # hermes_cli.plugins) transitively; the policy must already be frozen when they load.
     bind_worker_policy(frame)

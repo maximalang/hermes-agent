@@ -21,6 +21,13 @@ from hermes_state_runtime import RuntimeStoreError
 # The interpreter only imports psutil before it introduces itself; a child silent this long
 # is wedged (loader/stdio stall), not slow.
 HELLO_SECONDS = 60
+
+# Total budget from bootstrap-send to the child's 'ready' frame. Construction imports the whole
+# agent stack (providers → openai → numpy: DLL loads that can wedge for good under memory
+# pressure); before this bound the drain waited on next_frame(None) forever and the wedged child
+# became an unkillable-by-reclaim zombie (2026-10-21). Generous on purpose: a healthy cold start
+# is ~10-120 s, and the claim TTL reaper stays the outer bound for everything after 'ready'.
+MANAGED_READY_SECONDS = 300
 # After Stop the child interrupts its agent and emits its result; the owner terminates a
 # child that has not acknowledged within this window instead of waiting on the pipe forever.
 STOP_ACK_SECONDS = 30
@@ -622,8 +629,18 @@ async def execute_managed(authority, ref, row, policy):
         worker.secrets.extend(v for v in (frame['api_key'], scope['secret']) if isinstance(v, str) and v)
         await asyncio.to_thread(worker.send, frame)
         worker.writer.start()
+        ready_seen = False
+        ready_deadline = time.monotonic() + MANAGED_READY_SECONDS
         while True:
-            frame = await worker.next_frame(None, ack=STOP_ACK_SECONDS)
+            # Until 'ready' the child is only constructing; bound that window so a wedged startup
+            # is killed and retried instead of parking this drain forever on next_frame(None).
+            timeout = None if ready_seen else max(0.0, ready_deadline - time.monotonic())
+            try:
+                frame = await worker.next_frame(timeout, ack=STOP_ACK_SECONDS)
+            except RuntimeStoreError as exc:
+                if not ready_seen and exc.reason == 'managed_worker_hello_timeout':
+                    raise RuntimeStoreError('managed_worker_ready_timeout') from exc
+                raise
             # The claim's execution stamp, not a ledger read per frame (publish_execution fences the same way).
             if authority.executing.get(ref.session_id) != row['generation']:
                 raise RuntimeStoreError('stale_generation')
@@ -634,6 +651,7 @@ async def execute_managed(authority, ref, row, policy):
                 raise RuntimeStoreError('managed_worker_failed')
             kind = frame.get('type')
             if kind == 'ready' and set(frame) == {'type', 'pid'} and frame['pid'] == scope['pid']:
+                ready_seen = True
                 continue
             if kind == 'delta' and set(frame) == {'type', 'text'} and isinstance(frame['text'], str):
                 authority.publish_execution(ref.session_id, row['generation'], 'message.delta', {'text': frame['text']})
@@ -671,6 +689,13 @@ async def execute_managed(authority, ref, row, policy):
                 # this settles like an ordinary interrupted turn (the finally kills the child).
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             raise
+        if isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_ready_timeout':
+            # The child never reached 'ready': no turn executed, so this settles interrupted
+            # (retryable), never unknown — a wedged startup must not pause accepted followers.
+            from gateway.session_worker_reservation import lose_admission_worker
+            from gateway.session_runtime_workers import tracked_write
+            await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
+            return _interrupted_before_bootstrap(authority, row, 'managed_worker_ready_timeout')
         from gateway.session_worker_reservation import lose_admission_worker
         from gateway.session_runtime_workers import tracked_write
         await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))

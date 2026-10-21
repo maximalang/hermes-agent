@@ -70,3 +70,49 @@ def test_settlement_stops_a_silent_managed_worker_instead_of_waiting_unbounded(m
     assert task.done() and not task.cancelled() and task.result() == ''
     assert authority.pending_results['adm']['result']['interrupted'] is True
     assert authority._managed_workers == {}
+
+
+@pytest.mark.platforms("linux")
+def test_wedged_before_ready_settles_interrupted_within_the_ready_budget(monkeypatch):
+    """2026-10-21 zombie class: a child that says hello, takes its bootstrap and then wedges
+    mid-construction (numpy import stuck in a DLL load under memory pressure) must die inside
+    ``MANAGED_READY_SECONDS`` and settle INTERRUPTED — never unknown (nothing executed), never
+    parked on ``next_frame(None)`` forever while reclaim kills only the dispatcher submitter."""
+    from gateway import session_managed_worker as managed
+
+    original = subprocess.Popen
+
+    def hello_then_silent_child(args, **kwargs):
+        return original([sys.executable, '-c',
+                         'import sys, time; sys.stdout.write(\'{"type": "hello"}\\n\'); '
+                         'sys.stdout.flush()\nwhile True: time.sleep(1)'], **kwargs)
+    monkeypatch.setattr(managed.subprocess, 'Popen', hello_then_silent_child)
+    monkeypatch.setattr(managed, 'MANAGED_READY_SECONDS', 2)
+
+    def fake_reserve(authority, *, admission_id, process, principal_id, hello):
+        return {'pid': process.pid, 'birth': 'x', 'session_id': 's', 'execution_id': 'e', 'secret': None}
+    monkeypatch.setattr(managed, 'reserve_admission_worker', fake_reserve)
+    monkeypatch.setattr(managed, '_bootstrap',
+                        lambda *a: {'type': 'bootstrap', 'api_key': None, 'policy': {}, 'scope': {}})
+    # The loss bookkeeping needs the real session DB; this test pins the ready-budget branch's
+    # settlement, not the ledger write (covered by the reservation shards).
+    import gateway.session_worker_reservation as reservation
+    monkeypatch.setattr(reservation, 'lose_admission_worker', lambda authority, row, scope: None)
+
+    ref = SessionRef('profile', 's')
+    live = SimpleNamespace(task=None, route='r', event_stream=SimpleNamespace(execution={}))
+    authority = SimpleNamespace(profile_id='profile', pending_results={}, waiters={}, sessions={'s': live},
+                                check_approval_generation=lambda *a: None, pending_stops={}, adopted={},
+                                adopt_agent=lambda session_id, generation, worker: None)
+    runner = SimpleNamespace(session_authority=authority)
+    authority.runner = runner
+    row = {'admission_id': 'adm', 'principal_id': 'owner', 'generation': 3, 'payload': {'text': 'go'}}
+
+    async def scenario():
+        live.task = asyncio.create_task(managed.execute_managed(authority, ref, row, policy=None))
+        return await asyncio.wait_for(live.task, 30)
+
+    assert asyncio.run(scenario()) == ''
+    assert authority.pending_results['adm']['result']['interrupted'] is True
+    assert authority.pending_results['adm']['result']['interrupt_message'] == 'managed_worker_ready_timeout'
+    assert authority._managed_workers == {}
