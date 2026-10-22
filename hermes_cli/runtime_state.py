@@ -34,8 +34,16 @@ LOG = logging.getLogger(__name__)
 # same rule boot_bootstrap._RecordLock states for home maintenance.
 INSTALL_LOCK_TIMEOUT_SECONDS = 10.0
 
-# A lease file younger than this is never a prune candidate: its creator may still sit between
-# ``O_CREAT|O_EXCL`` and ``flock`` (two syscalls; the window is microseconds, the margin generous).
+# A lease file younger than this is never an unlink candidate: its creator may still
+# sit between ``O_CREAT|O_EXCL`` and ``flock`` (two syscalls; the window is microseconds,
+# the margin generous). The lock check itself is never deferred — a collector must see a
+# young live lease immediately — so the grace only delays reclaiming abandoned files,
+# never the held answer. A process taking its own lease prunes unconditionally: the take
+# loop's ``exists()`` recheck already resolves the same race, so self-heal at boot need
+# not wait out the grace.
+LEASE_MIN_AGE_SECONDS = 30.0
+
+
 @contextmanager
 def runtime_lock(project: Path, *, timeout: float | None = INSTALL_LOCK_TIMEOUT_SECONDS):
     """Hold the per-install dependency lock; yields True when held, False when the wait expired.
@@ -210,10 +218,10 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
 
 def leases_held(generation: Path) -> bool:
     """True while any process still holds a lease taken by ``lease_directory``."""
-    return _prune_unlocked_leases(generation / ".leases")
+    return _prune_unlocked_leases(generation / ".leases", min_age_seconds=LEASE_MIN_AGE_SECONDS)
 
 
-def _prune_unlocked_leases(leases: Path) -> bool:
+def _prune_unlocked_leases(leases: Path, *, min_age_seconds: float = 0.0) -> bool:
     """Remove abandoned lease files and report whether any live lock remains.
 
     Kernel locks disappear even when ``execv``, ``os._exit`` or a crash bypasses
@@ -224,6 +232,7 @@ def _prune_unlocked_leases(leases: Path) -> bool:
     same checkout) is held, never a boot failure.
     """
     held = False
+    cutoff = time.time() - min_age_seconds if min_age_seconds > 0 else None
     for lease in leases.glob("*"):
         try:
             fd = os.open(lease, os.O_RDWR)
@@ -233,11 +242,28 @@ def _prune_unlocked_leases(leases: Path) -> bool:
             held = True
             continue
         try:
-            if not _lock(fd, wait=False):
-                held = True
-            else:
-                with suppress(OSError):
-                    lease.unlink()
+            locked = _lock(fd, wait=False)
         finally:
+            # Close BEFORE unlinking: Windows refuses to unlink a file this process
+            # still holds open (the CRT open shares read and write, not delete;
+            # WinError 32), which silently left every pruned lease file in place —
+            # a monotonic leak after killed workers. Closing first is also correct
+            # on POSIX and races no one: only pruners lock existing lease names, a
+            # lease taker creates fresh ``O_EXCL`` names and rechecks ``exists()``
+            # after locking, and a peer pruner racing the unlink sees the same
+            # unlocked file and at worst loses the unlink to a FileNotFoundError.
             os.close(fd)
+        if not locked:
+            held = True
+            continue
+        if cutoff is not None:
+            # Grace delays only the unlink; the held answer above already reflects
+            # a young lease's live owner (or its unopenable file, fail closed).
+            try:
+                if lease.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+        with suppress(OSError):
+            lease.unlink()
     return held

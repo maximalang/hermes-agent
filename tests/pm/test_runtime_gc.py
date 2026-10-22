@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -83,6 +84,73 @@ os._exit(0)
     assert list(leases.iterdir()) == []
 
 
+def test_prune_keeps_lease_of_a_live_owner(tmp_path):
+    """A lease another running process holds is never unlinked; its death releases it."""
+    from hermes_cli import runtime_state
+    from hermes_cli.runtime_state import lease_directory
+
+    generation = _generation(tmp_path / "pm-runtime", "selected")
+    marker = tmp_path / "worker-ready"
+    code = """
+import sys
+import time
+from pathlib import Path
+from hermes_cli.runtime_state import lease_directory
+
+lease_directory(Path(sys.argv[1]))
+Path(sys.argv[2]).write_text("ok", encoding="utf-8")
+time.sleep(120)
+"""
+    worker = subprocess.Popen(
+        [sys.executable, "-c", code, str(generation), str(marker)],
+        env=dict(os.environ), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(300):
+            if marker.is_file():
+                break
+            assert worker.poll() is None, "lease holder exited before signaling ready"
+            time.sleep(0.1)
+        assert marker.is_file(), "lease holder never became ready"
+
+        release = lease_directory(generation)
+        try:
+            # The live owner's lease survives: locked files are held, not pruned.
+            assert len(list((generation / ".leases").iterdir())) == 2
+        finally:
+            release()
+        worker.kill()
+        worker.wait(timeout=30)
+
+        runtime_state._prune_unlocked_leases(generation / ".leases")
+        # Only the dead owner's lease went away; nothing of ours remains either.
+        assert list((generation / ".leases").iterdir()) == []
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=30)
+
+
+def test_leases_held_graces_fresh_lease_files(tmp_path):
+    """Collector reads honor the TTL: a fresh abandoned lease stays for its grace,
+    a TTL-expired one is reclaimed."""
+    from hermes_cli.runtime_state import LEASE_MIN_AGE_SECONDS, leases_held
+
+    generation = _generation(tmp_path / "pm-runtime", "selected")
+    leases = generation / ".leases"
+    leases.mkdir()
+    fresh = leases / "fresh-abandoned"
+    fresh.touch()
+    assert fresh.exists()
+
+    assert leases_held(generation) is False
+    assert fresh.exists(), "a lease younger than the grace must not be pruned"
+
+    expired = time.time() - LEASE_MIN_AGE_SECONDS - 60
+    os.utime(fresh, (expired, expired))
+    assert leases_held(generation) is False
+    assert not fresh.exists(), "a TTL-expired unlocked lease must be pruned"
+
+
 @pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root opens mode-0 files")
 def test_prune_keeps_unopenable_sibling_lease(tmp_path):
     """A lease this user cannot open (root-owned, `sudo hermes` on the same checkout) is HELD:
@@ -103,6 +171,9 @@ def test_prune_keeps_unopenable_sibling_lease(tmp_path):
         foreign.chmod(0o600)
 
 
+@pytest.mark.skipif(os.name == "nt", reason=(
+    "the peer race requires unlinking a lease file its creator still holds open; "
+    "Windows denies that unlink by design, so the race cannot occur there"))
 def test_lease_taken_while_a_peer_pruned_it_is_retaken(tmp_path, monkeypatch):
     """A peer's prune can lock-and-unlink our lease between create and flock; the writer must
     end up holding a lease the collectors can see, never an unlinked inode."""
