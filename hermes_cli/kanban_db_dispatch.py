@@ -472,11 +472,13 @@ def _terminate_reclaimed_worker(
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
         info["signal_refused"] = True
+        info["refusal_reason"] = "unverified_worker_fingerprint"
         info["terminated"] = not _kb._pid_alive(pid)
         return info
     recycled = _pid_recycled(pid, started_at) if _kb._pid_alive(pid) else False
     if recycled is None:
         info["signal_refused"] = True
+        info["refusal_reason"] = "worker_identity_unreadable"
         return info
     if recycled:
         info["terminated"] = True
@@ -507,60 +509,12 @@ def _terminate_reclaimed_worker(
     return info
 
 
-from hermes_cli.kanban_db_reaping import _signal_bound_interpreter, reap_terminal_workers
-
-
-def _worker_survived_termination(termination: dict) -> bool:
-    """True when a worker we cannot prove dead may still be running.
-
-    Releasing the claim then would spawn a second worker beside the first —
-    the duplication loop. Two cases qualify: (a) we signalled our own
-    host-local worker and it is still alive, and (b) the signal was refused
-    (``signal_refused``) — an identity we could not verify, a non-local lock,
-    or the current process itself. A refusal is no proof of death, so the
-    claim is held (defer) until the run's own host or an operator resolves
-    it; only a proven termination (``terminated``) may fall through to the
-    release path.
-    """
-    return bool(
-        (termination.get("signal_refused")
-         or (termination.get("host_local") and termination.get("termination_attempted")))
-        and not termination.get("terminated")
-    )
-
-
-def _defer_reclaim_for_live_worker(
-    conn: sqlite3.Connection,
-    task_id: str,
-    claim_lock: Optional[str],
-    now: int,
-    termination: dict,
-    *,
-    reason: str,
-    expected_run_id,
-) -> None:
-    """Hold a claim whose worker survived termination instead of releasing it.
-
-    Extends ``claim_expires`` by ``RECLAIM_DEFER_GRACE_SECONDS`` so the task
-    stays ``running`` (no duplicate spawn) and records ``reclaim_deferred``.
-    The next tick retries the kill; not spawning a duplicate is what lets the
-    throttled worker finally die.
-    """
-    grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
-    with _kb.write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ? AND current_run_id IS ?",
-            (grace, task_id, claim_lock, expected_run_id),
-        )
-        if cur.rowcount != 1:
-            return
-        run_id = _kb._current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id))
-        payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
-        payload.update(termination)
-        _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+from hermes_cli.kanban_db_reaping import (
+    _defer_reclaim_for_live_worker,
+    _signal_bound_interpreter,
+    _worker_survived_termination,
+    reap_terminal_workers,
+)
 
 
 def heartbeat_worker(

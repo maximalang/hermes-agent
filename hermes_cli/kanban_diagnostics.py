@@ -736,6 +736,215 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_stale_running(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A ``running`` card whose claim expired >= cfg["stale_running_grace_seconds"]
+    (default 1h) ago with no live recorded worker.
+
+    Nothing in the dispatcher is going to free this card — its reclaim paths can decline a
+    card whose owner receipt never resolved, and until they could not, the failure was
+    invisible: an operator saw only the cards queued behind the profile's worker cap. So the
+    jam itself is the signal. Silent in every shape that can still progress: a live claim
+    (the owner is still working), a heartbeat inside the dispatcher's max-stale window, a
+    foreign host's lock (its pids say nothing here), or a live recorded worker. Read-only.
+    """
+    grace_seconds = float(cfg.get("stale_running_grace_seconds", 60 * 60))
+    if _task_field(task, "status") != "running":
+        return []
+    from hermes_cli import kanban_db as kb
+    expires = kb._to_epoch(_task_field(task, "claim_expires", None))
+    if expires is None or (now - expires) < grace_seconds:
+        return []
+    lock = str(_task_field(task, "claim_lock", "") or "")
+    if not lock.startswith(kb._host_prefix()):
+        return []
+    hb = kb._to_epoch(_task_field(task, "last_heartbeat_at", None))
+    if hb is not None and (now - hb) <= kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS:
+        return []
+
+    from hermes_cli.kanban_db_dispatch import _worker_alive
+    recorded = [(_task_field(task, "worker_pid", None),
+                 _task_field(task, "worker_started_at", None))]
+    # Only this attempt's pids speak for it: an earlier run's worker that is still alive
+    # (or whose number was reused) says nothing about whether the current run is executing.
+    run_id = _task_field(task, "current_run_id", None)
+    for ev in events:
+        if run_id is not None and _task_field(ev, "run_id", None) != run_id:
+            continue
+        if _event_kind(ev) in {"spawned", "worker_bound"}:
+            payload = _parse_payload(ev)
+            recorded.append((payload.get("pid"), payload.get("started_at")))
+    pids = sorted({int(pid) for pid, _ in recorded if pid})
+    if any(_worker_alive(int(pid), started_at) for pid, started_at in recorded if pid):
+        return []
+
+    expired_seconds = now - expires
+    age_str = (f"{expired_seconds / 3600:.1f}h" if expired_seconds >= 3600
+               else f"{int(expired_seconds / 60)}m")
+    # Escalate with age: <2x grace warning, 2x-6x error, >6x critical.
+    if expired_seconds >= grace_seconds * 6:
+        severity = "critical"
+    elif expired_seconds >= grace_seconds * 2:
+        severity = "error"
+    else:
+        severity = "warning"
+
+    task_id = str(_task_field(task, "id") or "")
+    return [Diagnostic(
+        kind="stale_running", severity=severity,
+        title=f"Running {age_str} past its expired claim with no live worker",
+        detail=f"Nothing is executing this card and nothing has reclaimed it: the claim expired "
+               f"{age_str} ago, no heartbeat arrived inside the last hour, and no pid recorded for "
+               f"the run ({', '.join(str(p) for p in pids) or 'none'}) is alive. The dispatcher "
+               f"declines a reclaim when the run's owner receipt never resolved, so the card can "
+               f"hold its profile's worker slot indefinitely while every card queued behind it "
+               f"stays deferred. Check the card's log, then reclaim it.",
+        actions=[DiagnosticAction(kind="reclaim", label="Reclaim the dead claim", suggested=True),
+                 _cli_hint("Reclaim from the CLI", f"hermes kanban reclaim {task_id}")],
+        first_seen_at=expires, last_seen_at=expires, count=1,
+        data={"claim_expires": expires, "expired_seconds": int(expired_seconds),
+              "recorded_pids": pids, "last_heartbeat_at": hb,
+              "grace_seconds": int(grace_seconds)},
+    )]
+
+
+def _rule_reclaim_defer_exhausted(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A ``running`` card whose reclaim-defer series exhausted its budget.
+
+    The claim expired, but the recorded worker identity cannot be proven dead from this
+    host (foreign-host lock, unreadable payload, or an unverified pid now owned by another
+    process), so every reclaim path refuses to terminate and defers instead — correct,
+    since release would spawn a duplicate, but for a fundamentally unverifiable identity
+    the series used to spin forever (~720 events/day) with nothing watching. The
+    dispatcher now ends the series at ``reclaim_defer_threshold`` consecutive defers or
+    ``reclaim_defer_deadline_seconds`` since the first and holds the claim silently behind
+    a ``reclaim_defer_budget_exhausted`` marker. This rule fires on the marker OR on the
+    raw trailing series (event streams predating the marker) and points an operator at the
+    only resolutions: confirm the worker is dead on the host that spawned it, then
+    reclaim. Silent when the card leaves ``running`` or the series is inside budget.
+    Read-only.
+    """
+    if _task_field(task, "status") != "running":
+        return []
+    run_id = _task_field(task, "current_run_id", None)
+    threshold = _positive_int(cfg.get("reclaim_defer_threshold"), 24)
+    deadline = float(cfg.get("reclaim_defer_deadline_seconds", 2 * 3600))
+
+    def _scoped(ev) -> bool:
+        return run_id is None or _task_field(ev, "run_id", None) in (None, run_id)
+
+    count, first_ts, last_payload = 0, 0, None
+    marker_ts, marker_payload = None, None
+    for ev in reversed(events):
+        if not _scoped(ev):
+            continue
+        kind = _event_kind(ev)
+        if kind == "reclaim_deferred":
+            count += 1
+            first_ts = _event_ts(ev)
+            last_payload = last_payload or _parse_payload(ev)
+        elif kind == "reclaim_defer_budget_exhausted":
+            marker_ts, marker_payload = _event_ts(ev), _parse_payload(ev)
+            break
+        elif kind in {"claimed", "spawned", "worker_bound", "reclaimed", "completed"}:
+            break
+    if (marker_payload is None and count < threshold
+            and not (first_ts and now - first_ts >= deadline)):
+        return []
+
+    if marker_payload:
+        deferred_count = int(marker_payload.get("deferred_count") or count)
+        first_defer = int(marker_payload.get("first_deferred_at") or first_ts)
+    else:
+        deferred_count, first_defer = count, first_ts
+    payload = marker_payload or last_payload or {}
+    reason = payload.get("reason")
+    refusal = payload.get("refusal_reason")
+    pid = payload.get("prev_pid") or payload.get("pid")
+    task_id = str(_task_field(task, "id") or "")
+    return [Diagnostic(
+        kind="reclaim_defer_exhausted", severity="error", run_id=run_id,
+        title=f"Reclaim deferred {deferred_count}x — worker identity unverifiable from this host",
+        detail=f"The claim expired, but the recorded worker identity "
+               f"({refusal or reason or 'unverifiable'}) cannot be proven dead from this "
+               f"host, so the dispatcher keeps holding the claim instead of releasing it "
+               f"beside a possibly-live worker. The defer budget is exhausted: the card "
+               f"holds its profile's worker slot until an operator resolves it. Confirm "
+               f"the worker process is gone (pid {pid if pid is not None else 'unknown'}, "
+               f"on the host that spawned it), then reclaim the card.",
+        actions=[DiagnosticAction(kind="reclaim", label="Reclaim the dead claim", suggested=True),
+                 _cli_hint("Reclaim from the CLI", f"hermes kanban reclaim {task_id}"),
+                 _cli_hint("Inspect the defer series", f"hermes kanban events {task_id}")],
+        first_seen_at=first_defer or marker_ts or now, last_seen_at=marker_ts or now,
+        data={"deferred_count": deferred_count, "first_deferred_at": first_defer,
+              "reason": reason, "refusal_reason": refusal, "pid": pid,
+              "budget_marker": marker_payload is not None,
+              "threshold": threshold, "deadline_seconds": int(deadline)},
+    )]
+
+
+def _rule_reap_refused(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """The terminal reaper gave up on a worker identity (attempt budget spent).
+
+    ``reap_terminal_workers`` ends workers that outlived their run, but a refusal it can
+    never satisfy — a foreign-host lock, an unreadable payload, or (worst case) an
+    UNVERIFIED fingerprint whose dead worker's pid was reused by a long-lived process —
+    used to keep the row in the reap scan forever with no trace. Each refusal now appends
+    a ``bound_reap_refused`` marker; once ``reap_refusal_max_attempts`` are spent the row
+    leaves the scan and this marker is the only remaining signal: the possibly-live
+    worker (or the innocent pid owner) is beyond this host's reach and only an operator,
+    or the owning host's own reaper, can resolve it. Silent while attempts remain inside
+    the budget; clears once a ``terminal_worker_reaped`` lands for the same identity
+    (any host may append it). Read-only.
+    """
+    markers = [ev for ev in events if _event_kind(ev) == "bound_reap_refused"]
+    if not markers:
+        return []
+
+    def _identity(payload: dict):
+        if payload.get("bound_event_id") is not None:
+            return ("bound", payload.get("bound_event_id"))
+        return ("row", payload.get("pid"), payload.get("worker_started_at"))
+
+    latest = markers[-1]
+    lp = _parse_payload(latest)
+    ident = _identity(lp)
+    attempts = sum(1 for ev in markers if _identity(_parse_payload(ev)) == ident)
+    if attempts < _positive_int(cfg.get("reap_refusal_max_attempts"), 3):
+        return []
+    for ev in reversed(events):
+        if ev is latest:
+            break  # nothing newer than the last refusal resolved it
+        if _event_kind(ev) == "terminal_worker_reaped" and _identity(_parse_payload(ev)) == ident:
+            return []
+    reason = str(lp.get("refusal_reason") or "signal_refused")
+    pid = lp.get("pid")
+    task_id = str(_task_field(task, "id") or "")
+    worst_case = reason == "unverified_pid_in_use"
+    detail = (
+        f"The reaper refused to end a worker that outlived its run {attempts}x "
+        f"({reason}): the identity is unreachable from this host — a foreign-host "
+        f"lock, an unreadable payload"
+        + (f", or an unverified pid {pid} that a long-lived process now owns while the "
+           f"real worker may already be dead (confirm on the worker host before acting)"
+           if worst_case else "")
+        + ". The row left the reap scan; this clears when the identity is reaped."
+    )
+    return [Diagnostic(
+        kind="reap_refused", severity="warning",
+        title=f"Reap refused {attempts}x: {reason}",
+        detail=detail,
+        actions=[_cli_hint("Inspect the refusal markers", f"hermes kanban events {task_id}"),
+                 _cli_hint("Check the pid on the worker host",
+                           f"hermes kanban show {task_id}")],
+        first_seen_at=int(lp.get("first_refused_at") or _event_ts(latest)),
+        last_seen_at=_event_ts(latest),
+        data={"refusal_reason": reason, "attempts": attempts, "pid": pid,
+              "bound_event_id": lp.get("bound_event_id"),
+              "max_attempts": _positive_int(cfg.get("reap_refusal_max_attempts"), 3),
+              "pid_reuse_suspected": worst_case},
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
@@ -748,6 +957,9 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_stale_running,
+    _rule_reclaim_defer_exhausted,
+    _rule_reap_refused,
 ]
 
 
@@ -762,6 +974,20 @@ DEFAULT_CONFIG = {
     # Below 30 min the signal is dominated by tasks about to be claimed on
     # the next dispatcher tick.
     "stranded_threshold_seconds": 30 * 60,
+    # The dispatcher reclaims an expired claim on its own next tick, so a card
+    # still `running` an hour past its expiry means every reclaim path declined
+    # it. Same hour the heartbeat backstop uses.
+    "stale_running_grace_seconds": 60 * 60,
+    # Mirrors hermes_cli.kanban_db_reaping.RECLAIM_DEFER_MAX_CONSECUTIVE /
+    # RECLAIM_DEFER_MAX_AGE_SECONDS: past either bound the defer series stops
+    # behind a ``reclaim_defer_budget_exhausted`` marker and the held claim
+    # needs an operator.
+    "reclaim_defer_threshold": 24,
+    "reclaim_defer_deadline_seconds": 2 * 3600,
+    # Mirrors kanban_db_reaping.REAP_REFUSAL_MAX_ATTEMPTS: after this many
+    # refused attempts the row leaves the reap scan and the refusal marker is
+    # the only remaining signal.
+    "reap_refusal_max_attempts": 3,
 }
 
 

@@ -397,3 +397,91 @@ def test_operator_reclaim_never_signals_recycled_bound_pid(kanban_home, monkeypa
         assert kb.get_task(conn, tid).status == "ready"
     finally:
         conn.close()
+
+
+def test_defer_budget_ends_series_but_never_releases_claim(kanban_home, monkeypatch):
+    """t_4fcd3e44: an unverifiable identity refuses termination forever, so the
+    defer series is budgeted — past the budget one marker replaces the per-tick
+    events and the claim is still extended (never released: a duplicate spawn
+    beside a possibly-live worker stays forbidden)."""
+    from hermes_cli import kanban_db_reaping as kbr
+    conn = kbc.connect()
+    try:
+        tid, run = _claimed_task(conn)
+        lock = kb.get_task(conn, tid).claim_lock
+        kb._append_event(conn, tid, "worker_bound",
+                         {"pid": 9191, "claim_lock": lock,
+                          "started_at": kbd.UNVERIFIED_WORKER_FINGERPRINT},
+                         run_id=run.id)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 9191)
+        monkeypatch.setattr(kbd, "_pid_alive", lambda pid: pid == 9191)
+        monkeypatch.setattr(kbr, "RECLAIM_DEFER_MAX_CONSECUTIVE", 3)
+        monkeypatch.setattr(kbr, "RECLAIM_DEFER_MAX_AGE_SECONDS", 6 * 3600)
+        old = int(time.time()) - 30
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_expires = ?, started_at = ? WHERE id = ?",
+                         (old, old, tid))
+            conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (old, run.id))
+
+        for cycle in range(6):  # 3 budgeted defers, then one marker, then silence
+            assert kb.release_stale_claims(conn, signal_fn=lambda pid, sig: None) == 0
+            task = kb.get_task(conn, tid)
+            assert task.status == "running" and task.claim_lock == lock  # never released
+            assert task.claim_expires > old  # still extended: held, not parked
+            kinds = [e.kind for e in kb.list_events(conn, tid)]
+            if cycle < 3:
+                assert kinds.count("reclaim_deferred") == cycle + 1
+                assert "reclaim_defer_budget_exhausted" not in kinds
+            else:
+                assert kinds.count("reclaim_deferred") == 3  # series ended: no flood
+                assert kinds.count("reclaim_defer_budget_exhausted") == 1
+            with kb.write_txn(conn):  # next tick: the defer grace elapses again
+                conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (old, tid))
+
+        marker = next(e for e in kb.list_events(conn, tid)
+                      if e.kind == "reclaim_defer_budget_exhausted")
+        payload = marker.payload
+        assert payload["deferred_count"] == 3
+        assert payload["refusal_reason"] == "unverified_worker_fingerprint"
+    finally:
+        conn.close()
+
+
+def test_defer_budget_age_deadline_trips_from_first_defer(kanban_home, monkeypatch):
+    """The deadline arm: a short series whose FIRST defer is older than the age
+    budget marks on the next cycle even well below the consecutive bound."""
+    from hermes_cli import kanban_db_reaping as kbr
+    conn = kbc.connect()
+    try:
+        tid, run = _claimed_task(conn)
+        lock = kb.get_task(conn, tid).claim_lock
+        kb._append_event(conn, tid, "worker_bound",
+                         {"pid": 9191, "claim_lock": lock,
+                          "started_at": kbd.UNVERIFIED_WORKER_FINGERPRINT},
+                         run_id=run.id)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 9191)
+        monkeypatch.setattr(kbd, "_pid_alive", lambda pid: pid == 9191)
+        monkeypatch.setattr(kbr, "RECLAIM_DEFER_MAX_CONSECUTIVE", 100)  # count won't trip
+        monkeypatch.setattr(kbr, "RECLAIM_DEFER_MAX_AGE_SECONDS", 3600)
+        old = int(time.time()) - 30
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET claim_expires = ?, started_at = ? WHERE id = ?",
+                         (old, old, tid))
+            conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (old, run.id))
+        for _ in range(2):  # two ordinary defers inside the budget
+            assert kb.release_stale_claims(conn, signal_fn=lambda pid, sig: None) == 0
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (old, tid))
+        with kb.write_txn(conn):  # age the first defer past the deadline
+            conn.execute(
+                "UPDATE task_events SET created_at = created_at - 7200 WHERE id = "
+                "(SELECT MIN(id) FROM task_events WHERE task_id = ? "
+                " AND kind = 'reclaim_deferred')", (tid,))
+        assert kb.release_stale_claims(conn, signal_fn=lambda pid, sig: None) == 0
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert kinds.count("reclaim_deferred") == 2
+        assert kinds.count("reclaim_defer_budget_exhausted") == 1
+        task = kb.get_task(conn, tid)
+        assert task.status == "running" and task.claim_lock == lock  # still held
+    finally:
+        conn.close()

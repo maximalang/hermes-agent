@@ -221,3 +221,117 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# reclaim_defer_exhausted / reap_refused — defer budget + reap markers (t_4fcd3e44)
+# ---------------------------------------------------------------------------
+
+
+def test_reclaim_defer_rule_fires_on_simulated_series_over_threshold():
+    now = int(time.time())
+    task = _task(status="running", current_run_id=7)
+    events = [_event("claimed", ts=now - 4000)]
+    events += [_event("reclaim_deferred", ts=now - 4000 + i * 120,
+                      reason="ttl_expired_worker_alive",
+                      refusal_reason="unverified_worker_fingerprint", prev_pid=9191)
+               for i in range(30)]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    fired = [d for d in diags if d.kind == "reclaim_defer_exhausted"]
+    assert fired and fired[0].severity == "error"
+    assert fired[0].data["deferred_count"] == 30
+    assert fired[0].data["refusal_reason"] == "unverified_worker_fingerprint"
+    assert any(a.kind == "reclaim" for a in fired[0].actions)
+
+
+def test_reclaim_defer_rule_deadline_trips_below_threshold():
+    now = int(time.time())
+    task = _task(status="running", current_run_id=7)
+    events = [_event("reclaim_deferred", ts=now - 3 * 3600, reason="ttl_expired_worker_alive"),
+              _event("reclaim_deferred", ts=now - 7200, reason="ttl_expired_worker_alive"),
+              _event("reclaim_deferred", ts=now - 60, reason="ttl_expired_worker_alive")]
+    assert any(d.kind == "reclaim_defer_exhausted"
+               for d in kd.compute_task_diagnostics(task, events, [], now=now))
+
+
+def test_reclaim_defer_rule_silent_inside_budget_and_off_running():
+    now = int(time.time())
+    task = _task(status="running", current_run_id=7)
+    events = [_event("reclaim_deferred", ts=now - i * 120, reason="ttl_expired_worker_alive")
+              for i in range(5)]
+    assert not [d for d in kd.compute_task_diagnostics(task, events, [], now=now)
+                if d.kind == "reclaim_defer_exhausted"]
+    done = _task(status="done", current_run_id=7)
+    long_series = [_event("reclaim_deferred", ts=now - i * 120) for i in range(40)]
+    assert not [d for d in kd.compute_task_diagnostics(done, long_series, [], now=now)
+                if d.kind == "reclaim_defer_exhausted"]
+
+
+def test_reclaim_defer_rule_marker_is_fast_path():
+    now = int(time.time())
+    task = _task(status="running", current_run_id=7)
+    events = [
+        _event("reclaim_deferred", ts=now - 4000, reason="ttl_expired_worker_alive"),
+        _event("reclaim_defer_budget_exhausted", ts=now - 100, deferred_count=25,
+               first_deferred_at=now - 4000, refusal_reason="unverified_worker_fingerprint"),
+    ]
+    fired = [d for d in kd.compute_task_diagnostics(task, events, [], now=now)
+             if d.kind == "reclaim_defer_exhausted"]
+    assert fired and fired[0].data["budget_marker"] is True
+    assert fired[0].data["deferred_count"] == 25
+
+
+def test_reclaim_defer_rule_series_broken_by_lifecycle_event():
+    now = int(time.time())
+    task = _task(status="running", current_run_id=7)
+    events = ([_event("reclaim_deferred", ts=now - 5000 + i * 120) for i in range(30)]
+              + [_event("reclaimed", ts=now - 1000)]
+              + [_event("reclaim_deferred", ts=now - i * 120) for i in range(3)])
+    assert not [d for d in kd.compute_task_diagnostics(task, events, [], now=now)
+                if d.kind == "reclaim_defer_exhausted"]
+
+
+def test_reap_refused_rule_fires_when_attempt_budget_spent():
+    now = int(time.time())
+    task = _task(status="done", current_run_id=3)
+    events = [
+        _event("bound_reap_refused", ts=now - 3600, refusal_reason="claim_lock_not_local",
+               pid=9191, worker_started_at="unverified", attempt=1),
+        _event("bound_reap_refused", ts=now - 2400, refusal_reason="claim_lock_not_local",
+               pid=9191, worker_started_at="unverified", attempt=2),
+        _event("bound_reap_refused", ts=now - 1200, refusal_reason="claim_lock_not_local",
+               pid=9191, worker_started_at="unverified", attempt=3),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    fired = [d for d in diags if d.kind == "reap_refused"]
+    assert fired and fired[0].data["attempts"] == 3
+    assert fired[0].data["refusal_reason"] == "claim_lock_not_local"
+    assert fired[0].data["pid_reuse_suspected"] is False
+
+
+def test_reap_refused_rule_worst_case_pid_reuse():
+    now = int(time.time())
+    task = _task(status="done", current_run_id=3)
+    events = [_event("bound_reap_refused", ts=now - i * 600,
+                     refusal_reason="unverified_pid_in_use",
+                     pid=4242, worker_started_at="unverified", attempt=4 - i)
+              for i in (2, 1, 0)]
+    fired = [d for d in kd.compute_task_diagnostics(task, events, [], now=now)
+             if d.kind == "reap_refused"]
+    assert fired and fired[0].data["pid_reuse_suspected"] is True
+    assert fired[0].data["pid"] == 4242
+
+
+def test_reap_refused_rule_silent_inside_budget_and_after_reaping():
+    now = int(time.time())
+    task = _task(status="done", current_run_id=3)
+    two = [_event("bound_reap_refused", ts=now - 600, refusal_reason="claim_lock_not_local",
+                  pid=9191, worker_started_at="unverified", attempt=2),
+           _event("bound_reap_refused", ts=now - 300, refusal_reason="claim_lock_not_local",
+                  pid=9191, worker_started_at="unverified", attempt=1)]
+    assert not [d for d in kd.compute_task_diagnostics(task, two, [], now=now)
+                if d.kind == "reap_refused"]
+    resolved = two + [_event("terminal_worker_reaped", ts=now - 60, pid=9191,
+                             worker_started_at="unverified", terminated=True)]
+    assert not [d for d in kd.compute_task_diagnostics(task, resolved, [], now=now)
+                if d.kind == "reap_refused"]

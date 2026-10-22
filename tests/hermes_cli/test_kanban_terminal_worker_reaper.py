@@ -147,3 +147,96 @@ def test_one_failing_row_does_not_abort_the_sweep(conn):
         for p in (broken, healthy):
             p.kill()
             p.wait()
+
+
+def test_foreign_bound_worker_is_marked_refused_and_leaves_reap_scan(conn, monkeypatch):
+    """t_4fcd3e44: a refusal that can never succeed on this host (foreign-host
+    lock) appends one bound_reap_refused marker; the fresh marker keeps the row
+    out of the next scan instead of re-judging it every tick."""
+    import json as _json
+    from hermes_cli import kanban_db_reaping as kbr
+    tid = kb.create_task(conn, title="foreign bound", assignee="coder")
+    kb.claim_task(conn, tid, claimer=kb._claimer_id())
+    run_id = kb._current_run_id(conn, tid)
+    kb._append_event(conn, tid, "worker_bound",
+                     {"pid": 9191, "claim_lock": "otherhost:1", "started_at": None},
+                     run_id=run_id)
+    assert kb.complete_task(conn, tid, result="done", expected_run_id=run_id) is True
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_runs SET ended_at = ended_at - 600, claim_lock = 'otherhost:1' "
+                     "WHERE id = ?", (run_id,))
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 9191)
+
+    assert kbd.reap_terminal_workers(conn) == []  # nothing reaped: foreign identity
+    markers = [e for e in kb.list_events(conn, tid) if e.kind == "bound_reap_refused"]
+    assert len(markers) == 1
+    payload = markers[0].payload
+    assert payload["refusal_reason"] == "bound_identity_not_local"
+    assert payload["attempt"] == 1 and payload["bound_event_id"] is not None
+    assert not [e for e in kb.list_events(conn, tid) if e.kind == "terminal_worker_reaped"]
+    # Fresh marker = retry backoff: the row is out of the sample on the next tick.
+    assert kbd.reap_terminal_workers(conn) == []
+    assert len([e for e in kb.list_events(conn, tid)
+                if e.kind == "bound_reap_refused"]) == 1
+    assert kbr.REAP_REFUSAL_RETRY_QUIET_SECONDS >= 60  # backoff, not per-tick
+
+
+def test_unverified_pid_reused_by_live_process_is_marked_and_bounded(conn, monkeypatch):
+    """Worst case (t_4fcd3e44): the run's UNVERIFIED worker is dead but its pid
+    number is now owned by a long-lived process. The reaper never signals it;
+    refusal markers stop at the attempt budget and the row leaves the scan —
+    the diagnostics rule makes the state visible."""
+    import json as _json
+    from hermes_cli import kanban_diagnostics as kd
+    from hermes_cli import kanban_db_reaping as kbr
+    tid = kb.create_task(conn, title="unverified reuse", assignee="coder")
+    kb.claim_task(conn, tid, claimer=kb._claimer_id())
+    run_id = kb._current_run_id(conn, tid)
+    assert kb.complete_task(conn, tid, result="done", expected_run_id=run_id) is True
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ended_at - 600, worker_pid = 4242, "
+            "worker_started_at = ? WHERE id = ?",
+            (kbd.UNVERIFIED_WORKER_FINGERPRINT, run_id))
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 4242)
+    monkeypatch.setattr(kbr, "REAP_REFUSAL_RETRY_QUIET_SECONDS", 0)  # retry every tick
+
+    for _ in range(5):
+        assert kbd.reap_terminal_workers(conn) == []
+    markers = [e.payload for e in kb.list_events(conn, tid)
+               if e.kind == "bound_reap_refused"]
+    assert len(markers) == kbr.REAP_REFUSAL_MAX_ATTEMPTS  # bounded: 3, not 5
+    assert all(m["refusal_reason"] == "unverified_pid_in_use" for m in markers)
+    assert markers[-1]["attempt"] == 3
+    assert markers[-1]["pid"] == 4242
+    # The row left the scan with its evidence recorded; diagnostics flags it.
+    kept = conn.execute("SELECT worker_pid, worker_started_at FROM task_runs WHERE id = ?",
+                        (run_id,)).fetchone()
+    assert kept["worker_pid"] == 4242
+    diags = kd.compute_task_diagnostics(
+        kb.get_task(conn, tid), kb.list_events(conn, tid), kb.list_runs(conn, tid))
+    fired = [d for d in diags if d.kind == "reap_refused"]
+    assert fired and fired[0].data["pid_reuse_suspected"] is True
+
+
+def test_unverified_marker_retries_still_clear_evidence_when_pid_dies(conn, monkeypatch):
+    """Inside the retry budget a gone pid still clears its evidence: the marker
+    only suppresses pointless work, never the normal resolution path."""
+    from hermes_cli import kanban_db_reaping as kbr
+    tid = kb.create_task(conn, title="unverified then gone", assignee="coder")
+    kb.claim_task(conn, tid, claimer=kb._claimer_id())
+    run_id = kb._current_run_id(conn, tid)
+    assert kb.complete_task(conn, tid, result="done", expected_run_id=run_id) is True
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ended_at - 3600, worker_pid = 4242, "
+            "worker_started_at = ? WHERE id = ?",
+            (kbd.UNVERIFIED_WORKER_FINGERPRINT, run_id))
+    monkeypatch.setattr(kbr, "REAP_REFUSAL_RETRY_QUIET_SECONDS", 0)  # retry next tick
+    live = {4242}
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid in live)
+    assert kbd.reap_terminal_workers(conn) == []  # marked: pid in use
+    live.clear()  # the reused process exits
+    assert kbd.reap_terminal_workers(conn) == []  # not reaped, only cleared
+    kept = conn.execute("SELECT worker_pid FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    assert kept["worker_pid"] is None
