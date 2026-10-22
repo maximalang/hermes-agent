@@ -21,20 +21,25 @@ from pathlib import Path
 import sys
 import threading
 
-# Windows-only bootstrap ordering (t_d4350193): importing numpy from inside the plugin
-# loader — with the worker's stdin/WS reader threads already running — wedged every
-# bootstrap at the OpenBLAS DLL init (py-spy native stacks: loader-lock CS wait, CPU 0%).
-# The same import in a process without those threads takes 0.1 s (verified standalone,
-# below-normal priority, same venv), and OPENBLAS_NUM_THREADS=1 alone did NOT lift the
-# wedge (canary run 5426). So warm numpy HERE — module body runs before any reader
-# thread exists — and the later plugin import reuses sys.modules without a second DLL
-# load. Workers' numpy is light vector math, so one BLAS thread loses nothing;
-# setdefault keeps an operator's deliberate value. A missing numpy is not fatal.
+# Empirical Windows bootstrap ordering (t_d4350193): importing numpy from inside the
+# plugin loader wedged every bootstrap in the OpenBLAS DLL init (native py-spy stacks,
+# CPU 0%); OPENBLAS_NUM_THREADS=1 alone did NOT lift it (canary 5426 wedged with the pin
+# confirmed in the child env). The same import in a fresh process completes in 0.1 s
+# (verified standalone, below-normal priority, same env venv). So warm numpy HERE, in
+# the module body — which runs before execute() starts the worker's reader threads —
+# and the later plugin import reuses sys.modules without a second DLL load. The pin is
+# kept: one BLAS thread is enough for a worker's light vector math, and setdefault lets
+# an operator raise it. Missing numpy stays non-fatal (the plugin runs without it);
+# anything else is logged, never fatal, and left to the plugin's own import handling.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-try:  # prewarm: complete the DLL init single-threaded, before execute() starts readers
-    import numpy  # (the import side effect is the point)
-except Exception:  # pragma: no cover - environments without numpy simply run without it
+try:  # prewarm: finish the DLL init before execute() starts the reader threads
+    import numpy
+except ImportError:
     pass
+except Exception:
+    logging.getLogger("agent.managed_worker").warning(
+        "numpy prewarm failed; worker continues without it", exc_info=True
+    )
 
 logger = logging.getLogger(__name__)
 

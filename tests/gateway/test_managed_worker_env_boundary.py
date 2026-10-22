@@ -1,6 +1,7 @@
 """Managed worker boundary: a worker FOR another profile never inherits the launch profile's
 credentials, and a ledger id never names a path outside worker-outboxes (PR #106742 security lane)."""
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -73,37 +74,81 @@ def test_outbox_dir_only_names_paths_inside_worker_outboxes(tmp_path, bad):
         outbox_dir(tmp_path, "admission-worker:" + bad if bad else bad)
 
 
-def test_worker_pins_openblas_to_one_thread_before_runtime_imports(monkeypatch):
-    """The worker's stdin/WS reader threads predate agent init; OpenBLAS's DllMain builds its
-    thread pool under the Windows loader lock, and the pair deadlocked at the numpy import
-    (t_d4350193: 6/6 bootstraps idle-blocked). Importing the module must pin BLAS to one
-    thread — no pool, no deadlock — without overriding a deliberate operator setting."""
-    import importlib
+def _managed_worker_import_probe(tmp_path, extra_env=None, stub_numpy=True):
+    """Import agent.managed_worker in a clean subprocess; a stub numpy on PYTHONPATH
+    records the thread count and BLAS env AT the moment the prewarm import runs."""
+    import json
+    import os
+    import subprocess
     import sys
 
-    import agent.managed_worker
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(tmp_path) + os.pathsep + repo_root
+    env.pop("OPENBLAS_NUM_THREADS", None)
+    if extra_env:
+        env.update(extra_env)
+    probe = tmp_path / "probe.json"
+    if stub_numpy:
+        (tmp_path / "numpy").mkdir(exist_ok=True)
+        (tmp_path / "numpy" / "__init__.py").write_text(
+            "import json, os, threading\n"
+            f"open(r'{probe}', 'w').write(json.dumps({{\n"
+            "    'threads': threading.active_count(),\n"
+            "    'blas': os.environ.get('OPENBLAS_NUM_THREADS')}))\n",
+            encoding="utf-8",
+        )
+    else:
+        env["PYTHONPATH"] = repo_root  # real site-packages resolution, no stub
+    out = subprocess.run(
+        [sys.executable, "-c", "import agent.managed_worker"],
+        capture_output=True, text=True, cwd=repo_root, env=env, timeout=180, check=False,
+    )
+    return out, probe
 
-    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
-    importlib.reload(sys.modules["agent.managed_worker"])
-    assert os.environ["OPENBLAS_NUM_THREADS"] == "1"
 
-    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "8")
-    importlib.reload(sys.modules["agent.managed_worker"])
-    assert os.environ["OPENBLAS_NUM_THREADS"] == "8"
+def test_worker_imports_numpy_in_module_body_before_any_reader_thread(tmp_path):
+    """t_d4350193: the OpenBLAS DLL init wedged every bootstrap when numpy was first
+    imported from inside the plugin loader (after the worker's reader threads exist).
+    The prewarm must run in the module body — single-threaded, before any reader —
+    and the BLAS pin must already be set when numpy loads."""
+    import json
+
+    out, probe = _managed_worker_import_probe(tmp_path)
+    assert out.returncode == 0, out.stderr[-2000:]
+    data = json.loads(probe.read_text(encoding="utf-8"))
+    assert data["blas"] == "1"  # pin applied before the prewarm import
+    assert data["threads"] == 1  # module body: no reader threads started yet
 
 
-def test_worker_warms_numpy_before_reader_threads_exist(monkeypatch):
-    """The OpenBLAS DLL init wedged only when numpy was first imported with the worker's
-    reader threads already running (t_d4350193); warmed here — module body, no threads —
-    the same import takes 0.1 s. After import the module must hold numpy in sys.modules
-    so the later plugin import never loads the DLL under contention."""
-    import importlib
+def test_worker_prewarm_preserves_operator_blas_setting(tmp_path):
+    import json
+
+    out, probe = _managed_worker_import_probe(tmp_path, {"OPENBLAS_NUM_THREADS": "8"})
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert json.loads(probe.read_text(encoding="utf-8"))["blas"] == "8"
+
+
+def test_real_numpy_is_warm_after_managed_worker_import(tmp_path):
+    """In an environment that has numpy (the managed worker env does), importing the
+    worker module must leave it in sys.modules, so the holographic plugin's later
+    import reuses it and never loads the DLL under reader-thread contention."""
+    import os
+    import subprocess
     import sys
 
-    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
-    importlib.reload(sys.modules["agent.managed_worker"])
-    try:
-        import numpy
-    except ImportError:
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env = dict(os.environ)
+    env.pop("OPENBLAS_NUM_THREADS", None)
+    have = subprocess.run(
+        [sys.executable, "-c", "import importlib.util as u; print(u.find_spec('numpy') is not None)"],
+        capture_output=True, text=True, env=env, timeout=60, check=False,
+    )
+    if have.stdout.strip() != "True":
         pytest.skip("numpy not installed in this environment")
-    assert "numpy" in sys.modules
+    out = subprocess.run(
+        [sys.executable, "-c", "import agent.managed_worker, sys; print('numpy' in sys.modules)"],
+        capture_output=True, text=True, cwd=repo_root, env=env, timeout=180, check=False,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip() == "True"
