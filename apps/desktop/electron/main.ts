@@ -330,6 +330,7 @@ import { createKeepAwakeController } from './keep-awake-controller'
 import { applyLaunchProfileOverride } from './launch-profile'
 import { fetchLinkTitle, resolveFaviconCached } from './link-metadata'
 import { CHROMIUM_LOG_FILENAME, enableLinuxCrashDiagnostics, linuxCrashDiagnostics } from './linux-crash-diagnostics'
+import { enableWindowsCrashDiagnostics, windowsCrashDiagnostics } from './windows-crash-diagnostics'
 import {
   decideLinuxGpuLaunch,
   disableGpuSwitchNeededForReason,
@@ -1408,6 +1409,17 @@ enableLinuxCrashDiagnostics(CRASH_DIAGNOSTICS, CRASH_DIAGNOSTICS_LOGS_DIR, {
   reclaimChromiumLog: file => rotateLogIfNeededSync(file),
   appendSwitch: (name, value) => app.commandLine.appendSwitch(name, value),
   startCrashReporter: options => crashReporter.start(options)
+})
+
+// Windows coverage gap from the 2026-10-22 incident diagnosis: the crash
+// reporter was wired for Linux only, so on Windows no local minidumps were
+// captured. Local-only Crashpad dumps next to desktop.log; best-effort,
+// never a startup dependency.
+enableWindowsCrashDiagnostics(windowsCrashDiagnostics(CRASH_DIAGNOSTICS_LOGS_DIR, { appVersion: app.getVersion() }), {
+  ensureCrashesDir: dir => fs.mkdirSync(dir, { recursive: true }),
+  setCrashDumpsPath: dir => app.setPath('crashDumps', dir),
+  startCrashReporter: options => crashReporter.start(options),
+  logStatus: line => console.log(`[main] ${line}`)
 })
 
 const BOOT_FAKE_MODE = process.env.HERMES_DESKTOP_BOOT_FAKE === '1'
