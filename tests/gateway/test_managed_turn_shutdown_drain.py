@@ -72,47 +72,79 @@ def test_settlement_stops_a_silent_managed_worker_instead_of_waiting_unbounded(m
     assert authority._managed_workers == {}
 
 
-@pytest.mark.platforms("linux")
-def test_wedged_before_ready_settles_interrupted_within_the_ready_budget(monkeypatch):
-    """2026-10-21 zombie class: a child that says hello, takes its bootstrap and then wedges
-    mid-construction (numpy import stuck in a DLL load under memory pressure) must die inside
-    ``MANAGED_READY_SECONDS`` and settle INTERRUPTED — never unknown (nothing executed), never
-    parked on ``next_frame(None)`` forever while reclaim kills only the dispatcher submitter."""
+def test_ready_timeout_preserves_real_unknown_admission_and_cleans_child(tmp_path, monkeypatch):
+    """A missing ready frame bounds startup but cannot prove no effects occurred.
+
+    Use the real reservation/loss ledger: do not advertise interrupted while the
+    stored unknown admission still fences its queued follower.
+    """
+    from contextlib import closing
+    import threading
+
+    from hermes_state import SessionDB
+    from hermes_state_runtime import (
+        RuntimeStoreError, admit_session_input, begin_runtime_epoch, claim_session_input,
+    )
     from gateway import session_managed_worker as managed
 
     original = subprocess.Popen
+    children, notices = [], []
 
-    def hello_then_silent_child(args, **kwargs):
-        return original([sys.executable, '-c',
-                         'import sys, time; sys.stdout.write(\'{"type": "hello"}\\n\'); '
-                         'sys.stdout.flush()\nwhile True: time.sleep(1)'], **kwargs)
-    monkeypatch.setattr(managed.subprocess, 'Popen', hello_then_silent_child)
+    class HelloThenSilentChild(original):
+        def __init__(self, args, **kwargs):
+            super().__init__([sys.executable, '-c',
+                'import os,json,psutil,time; p=psutil.Process(); '
+                'print(json.dumps({"type":"hello","pid":os.getpid(),'
+                '"birth":p.create_time(),"ancestors":[os.getppid()]}),flush=True); '
+                'time.sleep(120)'], **kwargs)
+            children.append(self)
+
+    monkeypatch.setattr(managed.subprocess, 'Popen', HelloThenSilentChild)
+    monkeypatch.setattr(managed, '_worker_env', lambda authority: None)
     monkeypatch.setattr(managed, 'MANAGED_READY_SECONDS', 2)
-
-    def fake_reserve(authority, *, admission_id, process, principal_id, hello):
-        return {'pid': process.pid, 'birth': 'x', 'session_id': 's', 'execution_id': 'e', 'secret': None}
-    monkeypatch.setattr(managed, 'reserve_admission_worker', fake_reserve)
     monkeypatch.setattr(managed, '_bootstrap',
-                        lambda *a: {'type': 'bootstrap', 'api_key': None, 'policy': {}, 'scope': {}})
-    # The loss bookkeeping needs the real session DB; this test pins the ready-budget branch's
-    # settlement, not the ledger write (covered by the reservation shards).
-    import gateway.session_worker_reservation as reservation
-    monkeypatch.setattr(reservation, 'lose_admission_worker', lambda authority, row, scope: None)
+                        lambda *a: {'type': 'bootstrap', 'api_key': None, 'scope': {}})
+    with closing(SessionDB(tmp_path / 'state.db')) as db:
+        db.create_session('s', 'cli')
+        epoch = begin_runtime_epoch(db, instance_id='owner')
+        admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                            request_id='input', payload={'text': 'go'})
+        row = claim_session_input(db, epoch=epoch, session_id='s')
+        follower = admit_session_input(db, epoch=epoch, principal_id='human', session_id='s',
+                            request_id='follower', payload={'text': 'next'})
+        stream = SimpleNamespace(execution={}, lock=threading.RLock(),
+                                 publish=lambda *args: notices.append(args))
+        live = SimpleNamespace(task=None, route='r', event_stream=stream,
+                               controls=SimpleNamespace(snapshot=lambda *args: None))
+        authority = SimpleNamespace(db=db, epoch=epoch, profile_id=str(tmp_path),
+            pending_results={}, waiters={}, sessions={'s': live}, executing={'s': row['generation']},
+            _require_admission_open=lambda: None, _publish_pending=lambda *args: None,
+            check_approval_generation=lambda *args: None, pending_stops={}, adopted={},
+            adopt_agent=lambda *args: None)
+        authority.runner = SimpleNamespace(session_authority=authority)
+        ref = SessionRef(str(tmp_path), 's')
 
-    ref = SessionRef('profile', 's')
-    live = SimpleNamespace(task=None, route='r', event_stream=SimpleNamespace(execution={}))
-    authority = SimpleNamespace(profile_id='profile', pending_results={}, waiters={}, sessions={'s': live},
-                                check_approval_generation=lambda *a: None, pending_stops={}, adopted={},
-                                adopt_agent=lambda session_id, generation, worker: None)
-    runner = SimpleNamespace(session_authority=authority)
-    authority.runner = runner
-    row = {'admission_id': 'adm', 'principal_id': 'owner', 'generation': 3, 'payload': {'text': 'go'}}
+        async def scenario():
+            live.task = asyncio.create_task(managed.execute_managed(authority, ref, row, policy=None))
+            return await asyncio.wait_for(live.task, 30)
 
-    async def scenario():
-        live.task = asyncio.create_task(managed.execute_managed(authority, ref, row, policy=None))
-        return await asyncio.wait_for(live.task, 30)
-
-    assert asyncio.run(scenario()) == ''
-    assert authority.pending_results['adm']['result']['interrupted'] is True
-    assert authority.pending_results['adm']['result']['interrupt_message'] == 'managed_worker_ready_timeout'
-    assert authority._managed_workers == {}
+        try:
+            with pytest.raises(managed.ManagedExecutionUnknown, match='managed_worker_unknown'):
+                asyncio.run(scenario())
+            stored = db._read_one('SELECT status,outcome FROM session_admissions WHERE admission_id=?',
+                                   (row['admission_id'],))
+            assert tuple(stored) == ('unknown', None)
+            assert db._read_one('SELECT status FROM worker_executions')[0] == 'terminal'
+            with pytest.raises(RuntimeStoreError, match='unknown_execution'):
+                claim_session_input(db, epoch=epoch, session_id='s')
+            assert db._read_one('SELECT status FROM session_admissions WHERE admission_id=?',
+                               (follower['admission_id'],))[0] == 'queued'
+            assert row['admission_id'] not in authority.pending_results
+            assert notices and notices[-1][1]['outcome'] == 'unknown'
+            assert authority._managed_workers == {}
+            assert children and all(child.poll() is not None for child in children)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
