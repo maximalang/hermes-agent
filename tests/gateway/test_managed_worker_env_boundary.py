@@ -119,7 +119,9 @@ def test_worker_imports_numpy_in_module_body_before_any_reader_thread(tmp_path):
     assert out.returncode == 0, out.stderr[-2000:]
     provenance = next(l for l in out.stdout.splitlines() if l.startswith("PROVENANCE"))
     repo_root = str(Path(__file__).resolve().parents[2])
-    assert provenance.split(" ", 1)[1].lower().startswith(repo_root.lower()), provenance
+    assert Path(provenance.split(" ", 1)[1].strip()).resolve() == (
+        Path(repo_root) / "agent" / "managed_worker.py"
+    ).resolve(), provenance
     data = json.loads(probe.read_text(encoding="utf-8"))
     assert data["blas"] == "1"  # pin applied before the prewarm import
     assert data["threads"] == 1  # module body: no reader threads started yet
@@ -141,18 +143,27 @@ def test_real_numpy_is_warm_after_managed_worker_import(tmp_path):
     import subprocess
     import sys
 
-    repo_root = str(Path(__file__).resolve().parents[1])
+    repo_root = str(Path(__file__).resolve().parents[2])
     env = dict(os.environ)
     env.pop("OPENBLAS_NUM_THREADS", None)
     have = subprocess.run(
         [sys.executable, "-c", "import importlib.util as u; print(u.find_spec('numpy') is not None)"],
         capture_output=True, text=True, env=env, timeout=60, check=False,
     )
-    if have.stdout.strip() != "True":
+    if have.returncode == 0 and have.stdout.strip() == "False":
         pytest.skip("numpy not installed in this environment")
+    assert have.returncode == 0 and have.stdout.strip() == "True", have.stderr[-500:]
     out = subprocess.run(
-        [sys.executable, "-c", "import agent.managed_worker, sys; print('numpy' in sys.modules)"],
+        [sys.executable, "-c",
+         "import agent, agent.managed_worker as mw, sys\n"
+         "from pathlib import Path\n"
+         "print('PROV', Path(mw.__file__).resolve())\n"
+         "print('numpy' in sys.modules)"],
         capture_output=True, text=True, cwd=repo_root, env=env, timeout=180, check=False,
     )
     assert out.returncode == 0, out.stderr[-2000:]
-    assert out.stdout.strip() == "True"
+    prov = next(l for l in out.stdout.splitlines() if l.startswith("PROV "))
+    assert Path(prov[len("PROV "):].strip()).resolve() == (
+        Path(repo_root) / "agent" / "managed_worker.py"
+    ).resolve(), prov
+    assert out.stdout.strip().splitlines()[-1] == "True"
