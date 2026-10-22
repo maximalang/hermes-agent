@@ -1,5 +1,6 @@
 """Managed worker boundary: a worker FOR another profile never inherits the launch profile's
 credentials, and a ledger id never names a path outside worker-outboxes (PR #106742 security lane)."""
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -70,3 +71,22 @@ def test_outbox_dir_only_names_paths_inside_worker_outboxes(tmp_path, bad):
     assert outbox_dir(tmp_path, "admission-worker:" + "ab" * 16).parent == tmp_path / "worker-outboxes"
     with pytest.raises(ValueError):
         outbox_dir(tmp_path, "admission-worker:" + bad if bad else bad)
+
+
+def test_worker_pins_openblas_to_one_thread_before_runtime_imports(monkeypatch):
+    """The worker's stdin/WS reader threads predate agent init; OpenBLAS's DllMain builds its
+    thread pool under the Windows loader lock, and the pair deadlocked at the numpy import
+    (t_d4350193: 6/6 bootstraps idle-blocked). Importing the module must pin BLAS to one
+    thread — no pool, no deadlock — without overriding a deliberate operator setting."""
+    import importlib
+    import sys
+
+    import agent.managed_worker
+
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    importlib.reload(sys.modules["agent.managed_worker"])
+    assert os.environ["OPENBLAS_NUM_THREADS"] == "1"
+
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "8")
+    importlib.reload(sys.modules["agent.managed_worker"])
+    assert os.environ["OPENBLAS_NUM_THREADS"] == "8"
