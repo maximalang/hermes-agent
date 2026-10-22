@@ -82,7 +82,7 @@ def _managed_worker_import_probe(tmp_path, extra_env=None, stub_numpy=True):
     import subprocess
     import sys
 
-    repo_root = str(Path(__file__).resolve().parents[1])
+    repo_root = str(Path(__file__).resolve().parents[2])
     env = dict(os.environ)
     env["PYTHONPATH"] = str(tmp_path) + os.pathsep + repo_root
     env.pop("OPENBLAS_NUM_THREADS", None)
@@ -101,7 +101,8 @@ def _managed_worker_import_probe(tmp_path, extra_env=None, stub_numpy=True):
     else:
         env["PYTHONPATH"] = repo_root  # real site-packages resolution, no stub
     out = subprocess.run(
-        [sys.executable, "-c", "import agent.managed_worker"],
+        [sys.executable, "-c",
+         "import agent, agent.managed_worker as mw; print('PROVENANCE', mw.__file__); print('UNDER', agent.__file__)"],
         capture_output=True, text=True, cwd=repo_root, env=env, timeout=180, check=False,
     )
     return out, probe
@@ -116,6 +117,9 @@ def test_worker_imports_numpy_in_module_body_before_any_reader_thread(tmp_path):
 
     out, probe = _managed_worker_import_probe(tmp_path)
     assert out.returncode == 0, out.stderr[-2000:]
+    provenance = next(l for l in out.stdout.splitlines() if l.startswith("PROVENANCE"))
+    repo_root = str(Path(__file__).resolve().parents[2])
+    assert provenance.split(" ", 1)[1].lower().startswith(repo_root.lower()), provenance
     data = json.loads(probe.read_text(encoding="utf-8"))
     assert data["blas"] == "1"  # pin applied before the prewarm import
     assert data["threads"] == 1  # module body: no reader threads started yet
