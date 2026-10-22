@@ -164,7 +164,7 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
                                          bound_event_id=row["bound_id"])
             if row["worker_pid"] is not None and row["worker_started_at"] is not None:
                 _reap_terminal_worker_row(conn, row, host_prefix, signal_fn, reaped)
-        except Exception:
+        except Exception:  # health: allow BLE001 -- one row's failure (signal, /proc probe) must not abort the sweep; the debug log below carries exc_info=True
             _kb._log.debug(
                 "kanban dispatch: terminal worker reap failed for run %s (task %s)",
                 row["id"], row["task_id"], exc_info=True,
