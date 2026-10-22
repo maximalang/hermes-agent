@@ -21,13 +21,20 @@ from pathlib import Path
 import sys
 import threading
 
-# OpenBLAS's DllMain builds its thread pool while holding the Windows loader lock. A worker's
-# stdin/WS reader threads already run by agent init, and one inside winpthread can hold the
-# pthread lock while wanting the loader lock — a mutual block that wedged every bootstrap at
-# the numpy import (t_d4350193, 6/6 idle-blocked with py-spy evidence). One BLAS thread skips
-# the pool entirely; a worker's numpy is light vector math, so nothing of value is lost.
-# setdefault so an operator can deliberately raise it.
+# Windows-only bootstrap ordering (t_d4350193): importing numpy from inside the plugin
+# loader — with the worker's stdin/WS reader threads already running — wedged every
+# bootstrap at the OpenBLAS DLL init (py-spy native stacks: loader-lock CS wait, CPU 0%).
+# The same import in a process without those threads takes 0.1 s (verified standalone,
+# below-normal priority, same venv), and OPENBLAS_NUM_THREADS=1 alone did NOT lift the
+# wedge (canary run 5426). So warm numpy HERE — module body runs before any reader
+# thread exists — and the later plugin import reuses sys.modules without a second DLL
+# load. Workers' numpy is light vector math, so one BLAS thread loses nothing;
+# setdefault keeps an operator's deliberate value. A missing numpy is not fatal.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+try:  # prewarm: complete the DLL init single-threaded, before execute() starts readers
+    import numpy  # (the import side effect is the point)
+except Exception:  # pragma: no cover - environments without numpy simply run without it
+    pass
 
 logger = logging.getLogger(__name__)
 

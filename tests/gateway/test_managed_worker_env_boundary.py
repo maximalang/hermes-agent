@@ -90,3 +90,20 @@ def test_worker_pins_openblas_to_one_thread_before_runtime_imports(monkeypatch):
     monkeypatch.setenv("OPENBLAS_NUM_THREADS", "8")
     importlib.reload(sys.modules["agent.managed_worker"])
     assert os.environ["OPENBLAS_NUM_THREADS"] == "8"
+
+
+def test_worker_warms_numpy_before_reader_threads_exist(monkeypatch):
+    """The OpenBLAS DLL init wedged only when numpy was first imported with the worker's
+    reader threads already running (t_d4350193); warmed here — module body, no threads —
+    the same import takes 0.1 s. After import the module must hold numpy in sys.modules
+    so the later plugin import never loads the DLL under contention."""
+    import importlib
+    import sys
+
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    importlib.reload(sys.modules["agent.managed_worker"])
+    try:
+        import numpy
+    except ImportError:
+        pytest.skip("numpy not installed in this environment")
+    assert "numpy" in sys.modules
