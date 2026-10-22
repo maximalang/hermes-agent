@@ -2353,7 +2353,7 @@ def release_stale_claims(
     host_prefix = _host_prefix()
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
@@ -2376,11 +2376,16 @@ def release_stale_claims(
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
         )
+        from hermes_cli.kanban_db_dispatch import _signal_bound_interpreter
+        bound = _signal_bound_interpreter(conn, row["id"], row["current_run_id"],
+                                          signal_fn=signal_fn)
+        if _worker_survived_termination(bound):
+            termination = bound
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
-                reason="ttl_expired_worker_alive",
+                reason="ttl_expired_worker_alive", expected_run_id=row["current_run_id"],
             )
             continue
         with write_txn(conn):
@@ -2395,8 +2400,11 @@ def release_stale_claims(
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ? "
                 # A worker that registered its own pid since the SELECT keeps its claim.
-                "AND worker_pid IS ?",
-                (retry_status, row["id"], row["claim_lock"], now, row["worker_pid"]),
+                "AND worker_pid IS ? AND current_run_id IS ? "
+                "AND (SELECT MAX(id) FROM task_events WHERE task_id = tasks.id "
+                "     AND run_id = tasks.current_run_id AND kind = 'worker_bound') IS ?",
+                (retry_status, row["id"], row["claim_lock"], now, row["worker_pid"],
+                 row["current_run_id"], bound.get("bound_event_id")),
             )
             if cur.rowcount != 1:
                 continue
@@ -2434,48 +2442,10 @@ def release_stale_claims(
     return reclaimed
 
 
-def _record_reclaim(
-    conn: sqlite3.Connection, task_id: str, termination: dict, *, error: str, payload: dict,
-) -> Optional[int]:
-    """Close the active run as ``reclaimed`` and emit the ``reclaimed`` event
-    (payload merged with the termination report). Caller holds the txn."""
-    run_id = _end_run(
-        conn, task_id, outcome="reclaimed", status="reclaimed", error=error, metadata=termination,
-    )
-    payload.update(termination)
-    _append_event(conn, task_id, "reclaimed", payload, run_id=run_id)
-    return run_id
+from hermes_cli.kanban_db_reaping import _record_reclaim
 
 
-def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: int) -> None:
-    """TTL-expired claim whose host-local worker is alive: extend instead of
-    reclaiming (``claim_extended`` event). CAS on the same expired lock so a
-    concurrent reclaimer wins cleanly."""
-    new_expires = now + _resolve_claim_ttl_seconds()
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' "
-            "  AND claim_lock IS ? "
-            "  AND claim_expires IS NOT NULL "
-            "  AND claim_expires < ?", (new_expires, row["id"], row["claim_lock"], now),
-        )
-        if cur.rowcount != 1:
-            return
-        run_id = _extend_run_claim(conn, row["id"], new_expires)
-        _append_event(
-            conn, row["id"], "claim_extended",
-            {
-                "reason": "pid_alive",
-                "worker_pid": int(row["worker_pid"]),
-                "claim_lock": row["claim_lock"],
-                "claim_expires_was": _to_epoch(row["claim_expires"]),
-                "claim_expires_now": new_expires,
-                "last_heartbeat_at": _to_epoch(row["last_heartbeat_at"]),
-            },
-            run_id=run_id,
-        )
-
+from hermes_cli.kanban_db_reaping import _extend_live_stale_claim
 
 def reclaim_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, signal_fn=None,
@@ -2511,7 +2481,7 @@ def reclaim_task(
     # The run's bound interpreter is a separate tree from the submitter terminated above:
     # a gateway-managed child wedged in startup ignores the submitter's death (2026-10-21).
     from hermes_cli.kanban_db_dispatch import _signal_bound_interpreter
-    _signal_bound_interpreter(conn, task_id, run_id)
+    _signal_bound_interpreter(conn, task_id, run_id, signal_fn=signal_fn)
     # Operator intervention = fresh retry budget (own txn, runs after commit).
     _clear_failure_counter(conn, task_id)
     return True

@@ -586,6 +586,17 @@ async def _spawn_registered_worker(authority, ref, row):
     return worker, process
 
 
+async def _next_ready_frame(worker, ready_seen, deadline):
+    """Bound construction separately from the running turn's Stop/claim lifecycle."""
+    timeout = None if ready_seen else max(0.0, deadline - time.monotonic())
+    try:
+        return await worker.next_frame(timeout, ack=STOP_ACK_SECONDS)
+    except RuntimeStoreError as exc:
+        if not ready_seen and exc.reason == 'managed_worker_hello_timeout':
+            raise RuntimeStoreError('managed_worker_ready_timeout') from exc
+        raise
+
+
 async def execute_managed(authority, ref, row, policy):
     from gateway.run_turn_progress import publish_worker_tool_event
     # This route never passes the inbound prepare step, so the worker would read ``@`` tokens as typed.
@@ -632,15 +643,7 @@ async def execute_managed(authority, ref, row, policy):
         ready_seen = False
         ready_deadline = time.monotonic() + MANAGED_READY_SECONDS
         while True:
-            # Until 'ready' the child is only constructing; bound that window so a wedged startup
-            # is killed and retried instead of parking this drain forever on next_frame(None).
-            timeout = None if ready_seen else max(0.0, ready_deadline - time.monotonic())
-            try:
-                frame = await worker.next_frame(timeout, ack=STOP_ACK_SECONDS)
-            except RuntimeStoreError as exc:
-                if not ready_seen and exc.reason == 'managed_worker_hello_timeout':
-                    raise RuntimeStoreError('managed_worker_ready_timeout') from exc
-                raise
+            frame = await _next_ready_frame(worker, ready_seen, ready_deadline)
             # The claim's execution stamp, not a ledger read per frame (publish_execution fences the same way).
             if authority.executing.get(ref.session_id) != row['generation']:
                 raise RuntimeStoreError('stale_generation')
@@ -650,7 +653,7 @@ async def execute_managed(authority, ref, row, policy):
             if frame == {'type': 'error', 'reason': 'managed_worker_failed'}:
                 raise RuntimeStoreError('managed_worker_failed')
             kind = frame.get('type')
-            if kind == 'ready' and set(frame) == {'type', 'pid'} and frame['pid'] == scope['pid']:
+            if frame == {'type': 'ready', 'pid': scope['pid']}:
                 ready_seen = True
                 continue
             if kind == 'delta' and set(frame) == {'type', 'text'} and isinstance(frame['text'], str):
@@ -689,13 +692,8 @@ async def execute_managed(authority, ref, row, policy):
                 # this settles like an ordinary interrupted turn (the finally kills the child).
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             raise
-        if isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_ready_timeout':
-            # The child never reached 'ready': no turn executed, so this settles interrupted
-            # (retryable), never unknown — a wedged startup must not pause accepted followers.
-            from gateway.session_worker_reservation import lose_admission_worker
-            from gateway.session_runtime_workers import tracked_write
-            await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
-            return _interrupted_before_bootstrap(authority, row, 'managed_worker_ready_timeout')
+        # A missing ready frame bounds construction, but is not proof of no effects:
+        # preserve the ordinary unknown admission fence after any sent bootstrap.
         from gateway.session_worker_reservation import lose_admission_worker
         from gateway.session_runtime_workers import tracked_write
         await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
