@@ -21,6 +21,14 @@ from pathlib import Path
 import sys
 import threading
 
+# OpenBLAS's DllMain builds its thread pool while holding the Windows loader lock. A worker's
+# stdin/WS reader threads already run by agent init, and one inside winpthread can hold the
+# pthread lock while wanting the loader lock — a mutual block that wedged every bootstrap at
+# the numpy import (t_d4350193, 6/6 idle-blocked with py-spy evidence). One BLAS thread skips
+# the pool entirely; a worker's numpy is light vector math, so nothing of value is lost.
+# setdefault so an operator can deliberately raise it.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 logger = logging.getLogger(__name__)
 
 MAX_FRAME = 4 * 1024 * 1024
