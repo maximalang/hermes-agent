@@ -278,7 +278,9 @@ def test_worker_prewarm_failing_module_warns_not_fatal(tmp_path):
         stubs={"alpha": None, "boom": "raise RuntimeError('prewarm-boom-sentinel')\n"},
     )
     assert out.returncode == 0, out.stderr[-2000:]
-    assert [r["name"] for r in records] == ["alpha"]  # list keeps going past the failure
+    # boom records its probe line BEFORE it raises — the record proves the prewarm
+    # ATTEMPTED boom; alpha after it proves the list kept going past the failure.
+    assert [r["name"] for r in records] == ["boom", "alpha"]
     assert "boom prewarm failed; worker continues without it" in out.stderr
 
 
