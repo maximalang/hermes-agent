@@ -150,3 +150,50 @@ text.
 Long-form: `website/docs/developer-guide/agent-loop.md`, `prompt-assembly.md`,
 `context-compression-and-caching.md`, `provider-runtime.md`, `session-storage.md`,
 `subagent-lifecycle-api.md`.
+
+## Managed workers: heavy native DLLs load only BEFORE reader threads
+
+`agent/managed_worker.py` starts the reader thread (`WorkerControls.__init__`) and only
+then constructs the agent, so plugin discovery, memory providers and tool imports all run
+with that thread alive. On Windows a C-extension import holds the OS loader lock for its
+whole `DllMain`, and a `DllMain` may itself wait on thread sync (OpenBLAS builds its pool
+from `DllMain`); a second thread needing the loader lock — or a thread still in
+`DLL_THREAD_ATTACH` bootstrap — then wedges at CPU 0% forever, and `ExitProcess` needs the
+loader lock too, so the process cannot even die (the 2026-10-21 zombie workers; native
+py-spy stacks, run 5417). `scripts/repro_loaderlock_abba.py` reproduces the class
+deterministically (needs gcc on PATH; runs a control and a wedge scenario, exit 0 =
+control completed AND wedge deadlocked).
+
+Contract: import heavy native modules (numpy/scipy/torch/onnx/sherpa_onnx/faster_whisper/
+sounddevice/PIL/transformers) in the `agent.managed_worker` module body or earlier — never
+FIRST-load them after the reader threads exist. The module body prewarms a configurable
+list, `HERMES_WORKER_PREWARM_MODULES` (comma/space separated, default `numpy`, empty value
+disables); operators extend it through the gateway process env (single-profile gateways
+inherit it byte-for-byte) or the served profile's own `.env` (routed profiles strip the
+launch profile's `.env` residue — `gateway/session_managed_worker.py::_worker_env`).
+
+Audited post-reader first-load sites (t_dc7c5148; all lazy — they first fire AFTER
+`WorkerControls.__init__` unless prewarmed):
+
+- `hermes_cli/plugins.py:1795` — the `plugin-discovery` background thread imports every
+  plugin body; a plugin with a heavy dependency first-loads it here.
+- `plugins/memory/__init__.py:273-277` — warms only `_NATIVE_WARM_IMPORTS` (numpy);
+  embedding providers defer `sentence_transformers` (→ torch) to `is_available()`.
+- `tools/voice_mode.py:59-60,384`; `tools/wake_word.py:221-222,529`;
+  `tools/wake_word_engines.py:185,187,234` — numpy, sounddevice, sherpa_onnx.
+- `tools/transcription_local.py:175` — faster_whisper (ctranslate2 DLL).
+- `tools/tts_tool_speaker.py:310`, `tools/neutts_synth.py:18` — numpy.
+- `tools/computer_use/tool.py:875`, `tools/vision_tools.py:407,417`,
+  `tools/vision_tools_image_prep.py:65,216,259,292,308`, `tools/mcp_tool_content.py:139`,
+  `tools/bot_desktop/thumbnail.py:34`, `agent/conversation_compression.py:4274`,
+  `agent/image_routing.py:443` — PIL on first image in context.
+- `plugins/platforms/discord/voice_mixer.py:28` — numpy at first mix (voice extra).
+- `plugins/platforms/telegram/adapter.py:5053`, `plugins/platforms/simplex/adapter.py:520`
+  — PIL on first image message.
+- openai SDK `_extras.numpy_proxy` (site-packages) — numpy on the first numpy-typed payload.
+
+Audited and NOT worker-reachable: `tui_gateway/`, `agent/pet/`, `hermes_cli/clipboard.py`,
+`trajectory_compressor.py`, `optional-skills/`, `skills/` subprocess scripts. scipy/torch/
+onnx have no direct import outside `optional-skills/`; they reach a worker only via
+`sentence_transformers` (memory providers) or a plugin's own dependencies — which is what
+the prewarm list is for.
