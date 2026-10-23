@@ -23,26 +23,40 @@ def _pm_generation_dirs(prefixes) -> set[Path]:
     return found
 
 
-_INTERPRETER_PREFIXES = tuple({
-    Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
-} | {
-    # A PM-activated developer shell runs sys.prefix's python against a dependency generation
-    # whose site-packages sits under the (real) Hermes home; third-party imports from it are the
-    # interpreter's installation, not Hermes state.
-    Path(p).resolve() for p in sys.path if p and Path(p).name in ("site-packages", "dist-packages")
-} | {
-    # scripts/run_tests.sh runs a PM generation venv (<installs>/<key>/{environments,test-environment}
-    # /<gen>/venv) that sits under the home whenever HOME is the run's fake home. The generation dir
+def _lexical_and_resolved(path) -> set[Path]:
+    """Both spellings of an interpreter prefix. A relocatable venv chain reaches the real
+    installation through junctions/symlinks (uv: ``cpython-3.11-...`` → ``cpython-3.11.16-...``),
+    so ``Path(p).resolve()`` names the store while the process still SPELLS stdlib and
+    site-packages paths lexically (``sys.prefix`` is untouched; linecache reads traceback
+    sources exactly as the frame recorded them). A prefix kept only in resolved form never
+    matches those lexical reads, and check() refuses the lexical path before its own
+    realpath pass — every interpreter traceback looked like I/O against the real home."""
+    lexical = Path(path)
+    return {lexical, lexical.resolve()}
+
+
+_INTERPRETER_PREFIXES = tuple(
+    variant
+    for p in ((sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
+              # A PM-activated developer shell runs sys.prefix's python against a dependency
+              # generation whose site-packages sits under the (real) Hermes home; third-party
+              # imports from it are the interpreter's installation, not Hermes state.
+              + tuple(q for q in sys.path if q and Path(q).name in ("site-packages", "dist-packages")))
+    for variant in _lexical_and_resolved(p)
+) + (
+    # scripts/run_tests.sh runs a PM generation venv (<installs>/<key>/{environments,test-environment
+    # }/<gen>/venv) that sits under the home whenever HOME is the run's fake home. The generation dir
     # around the venv is that interpreter's installation too: `hermes update` probes
     # <venv>/../hermes_cli/main.py to find the checkout owning its venv (update_owning_install).
     *_pm_generation_dirs((sys.prefix, sys.exec_prefix)),
-} | {
+) + tuple(_lexical_and_resolved(
     # The default install checks the repo out INSIDE the home (install.sh:
     # INSTALL_DIR=$HERMES_HOME/hermes-agent). Reading test data, sources for tracebacks, or the
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
-    Path(__file__).resolve().parent.parent,
-})
+    Path(__file__).parent.parent,
+))
+
 # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
 # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
 # resolve once at import, as before: they are fixed for the process lifetime.
