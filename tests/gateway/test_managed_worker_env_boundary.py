@@ -191,12 +191,14 @@ def _prewarm_list_probe(tmp_path, extra_env=None, stubs=None):
         mod.mkdir(exist_ok=True)
         if body is None:  # plain record-and-return stub
             body = ""
-        (mod / "__init__.py").write_text(
+        # %-formatting (not f-strings): the dict braces below are literal source the
+        # child compiles, and %r quotes the Windows probe path with its backslashes.
+        stub_src = (
             "import json, threading\n"
-            f"open(r'{probe}', 'a').write(json.dumps({{'name': '{name}', "
-            "'threads': threading.active_count()}}) + '\n')\n" + body,
-            encoding="utf-8",
-        )
+            "open(%r, 'a').write(json.dumps({'name': %r, "
+            "'threads': threading.active_count()}) + '\\n')\n" % (str(probe), name)
+        ) + body
+        (mod / "__init__.py").write_text(stub_src, encoding="utf-8")
     watched = "(" + ",".join(repr(n) for n in stubs) + ")" if stubs else "()"
     out = subprocess.run(
         [sys.executable, "-c",
