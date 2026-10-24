@@ -19,6 +19,12 @@ from urllib.parse import quote
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
+# GitHub's paywall answer for the branch-rules API on private repositories
+# without GitHub Pro — "Upgrade to GitHub Pro or make this repository public
+# to enable this feature." No branch rules can be configured on such a plan,
+# so this refusal means "no rules", never a credentials problem.
+_FEATURE_GATE_MARKER = "Upgrade to GitHub Pro"
+
 
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
@@ -45,6 +51,10 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         # code + endpoint, never gh's stderr (credentials/host details).
         denied = re.search(r"HTTP (40[134])", exc.stderr or "")
         if denied:
+            if denied[1] == "403" and _FEATURE_GATE_MARKER in (exc.stderr or ""):
+                # The paywall 403 is a plan limit, not an identity problem.
+                raise _GateFeatureGated(
+                    f"HTTP 403 feature-gated on {endpoint.split('?')[0]}") from None
             raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
             raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
@@ -59,6 +69,14 @@ class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not
     an infrastructure blip to retry."""
+
+
+class _GateFeatureGated(_GateAuthError):
+    """gh was refused HTTP 403 carrying GitHub's paywall marker: the rules API
+    is feature-gated on this repository's plan (private, no GitHub Pro), so no
+    branch rules can be configured there. A plan limit, not an identity
+    problem — treated as an empty rules read by whoever catches it, while the
+    outer handler keeps classifying a stray one as `auth` (fail-closed)."""
 
 
 def _gh_env(profile_home: str | None) -> dict[str, str] | None:
@@ -133,8 +151,14 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        gated = False
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except _GateFeatureGated:
+            # Private repository without GitHub Pro: the rules API is paywalled,
+            # which is exactly "no branch rules can be configured" — read on.
+            rules, gated = [], True
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
@@ -142,6 +166,8 @@ def collect_acceptance(contract: str, published_pr: str | None,
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
+            if gated:
+                return _publication_acceptance(receipt, repo, number, profile_home)
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
@@ -188,6 +214,32 @@ def collect_acceptance(contract: str, published_pr: str | None,
         # Never persist gh stderr (credentials/host details); the failed phase is actionable.
         receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
         return receipt
+
+
+def _publication_acceptance(receipt: dict, repo: str, number: int,
+                            profile_home: str | None) -> dict:
+    """Acceptance fallback for feature-gated repositories: branch rules cannot
+    be configured there, so publication itself is the evidence — the PR must be
+    MERGED with a merge commit, read via the same profile's gh login. Anything
+    else (OPEN, missing merge commit, failed read) fails closed."""
+    command = ["gh", "pr", "view", f"{number:d}", "--repo", f"github.com/{repo}",
+               "--json", "state,mergeCommit"]
+    result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", timeout=30,
+                            check=True, env=_gh_env(profile_home))
+    view = json.loads(result.stdout)
+    state, merge = view.get("state"), view.get("mergeCommit") or {}
+    receipt["publication"] = {"state": state, "merge_commit": merge.get("oid")}
+    if state == "MERGED" and merge.get("oid"):
+        receipt.update(ok=True, classification="success",
+                       detail="Repository branch rules are feature-gated (private repository "
+                              "without GitHub Pro); publication accepted: PR is MERGED with a merge commit.")
+    else:
+        receipt.update(classification="pending" if state == "OPEN" else "missing",
+                       detail="Repository branch rules are feature-gated; publication not accepted "
+                              f"(gh pr view state={state!r}, mergeCommit "
+                              f"{'present' if merge.get('oid') else 'absent'}).")
+    return receipt
 
 
 def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:

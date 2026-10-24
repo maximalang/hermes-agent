@@ -1,6 +1,7 @@
 """Two lifecycle invariants, using real SQLite and a local GitHub HTTP contract."""
 import json
 import os
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_pr_acceptance as kpa
 from hermes_cli.kanban_db_connect import connect
 
 
@@ -20,11 +22,20 @@ def github(tmp_path, monkeypatch):
             state["requests"].append(self.path)
             sha = state["head"]
             if self.path == "/graphql":
+                protection = None if state.get("no_protection") else {
+                    "branchProtectionRule": {"requiredStatusChecks": [
+                        {"context": "required", "app": {"databaseId": 1}}]}}
                 value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                    "headRefOid": sha, "baseRefName": "main",
+                    "state": "MERGED" if state.get("pr_merged") else "OPEN",
+                    "baseRef": protection}}}}
             elif "/rules/branches/" in self.path:
+                if state.get("rules_refusal"):
+                    # A real gh renders this as `gh: <message> (HTTP 403)` on stderr.
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"message": state["rules_refusal"]}).encode())
+                    return
                 value = [[]]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
@@ -43,7 +54,10 @@ def github(tmp_path, monkeypatch):
             elif "/statuses" in self.path:
                 value = [[]]
             elif "/pulls/" in self.path:
-                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+                merged = bool(state.get("pr_merged"))
+                value = {"head": {"sha": sha}, "base": {"ref": "main"},
+                         "state": "closed" if merged else "open", "merged": merged,
+                         "merge_commit_sha": "c" * 40 if merged else None}
             else:
                 self.send_error(404)
                 return
@@ -60,9 +74,23 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
-                  f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+    gh.write_text(f"#!{sys.executable}\n"
+                  "import json, sys, urllib.error, urllib.request\n"
+                  f"base='http://127.0.0.1:{server.server_port}/'\n"
+                  "try:\n"
+                  "    if sys.argv[1] == 'pr':  # gh pr view N --repo [HOST/]OWNER/REPO --json state,mergeCommit\n"
+                  "        n = next(a for a in sys.argv[2:] if a.isdigit())\n"
+                  "        repo = sys.argv[sys.argv.index('--repo') + 1].split('/', 1)[-1]\n"
+                  "        pull = json.loads(urllib.request.urlopen(base + 'repos/' + repo + '/pulls/' + n).read())\n"
+                  "        merged = pull.get('merged')\n"
+                  "        print(json.dumps({'state': 'MERGED' if merged else pull['state'].upper(),\n"
+                  "                          'mergeCommit': {'oid': pull['merge_commit_sha']} if merged else None}))\n"
+                  "    else:  # gh api ENDPOINT --hostname github.com [...]\n"
+                  "        print(urllib.request.urlopen(base + sys.argv[2]).read().decode())\n"
+                  "except urllib.error.HTTPError as err:  # gh renders failures as `gh: <msg> (HTTP <code>)`\n"
+                  "    print('gh: ' + json.loads(err.read().decode()).get('message') + ' (HTTP ' + str(err.code) + ')',\n"
+                  "          file=sys.stderr)\n"
+                  "    sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -230,3 +258,123 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+# --- feature-gated rules API: private repositories without GitHub Pro ------------------
+#
+# GET /repos/{owner}/{repo}/rules/branches/{branch} answers HTTP 403
+# "Upgrade to GitHub Pro or make this repository public to enable this feature."
+# there — a paywall, not a credentials problem: no branch rules CAN be configured.
+# Observed live on maximalang/ventures (gh stderr: `gh: Upgrade to GitHub Pro or
+# make this repository public to enable this feature. (HTTP 403)`).
+
+_FEATURE_GATE_BODY = ("Upgrade to GitHub Pro or make this repository public "
+                      "to enable this feature.")
+
+
+def _gh_mock(monkeypatch, *, http_status=403, body=_FEATURE_GATE_BODY,
+             pr_state="MERGED", merge_commit="c" * 40, calls=None):
+    """Replace ``kanban_pr_acceptance.subprocess.run`` with a canned gh whose
+    rules read fails exactly like the real one — ``gh: <body> (HTTP <status>)``
+    on stderr, gh's exit 1 — and whose publication read answers
+    ``gh pr view --json state,mergeCommit``."""
+    def run(command, **kwargs):
+        if calls is not None:
+            calls.append(list(command))
+        if command[1] == "pr":
+            assert "--json" in command and "state,mergeCommit" in command
+            stdout = json.dumps({"state": pr_state,
+                                 "mergeCommit": {"oid": merge_commit} if merge_commit else None})
+        elif command[2] == "graphql":
+            stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "headRefOid": "a" * 40, "baseRefName": "main", "state": pr_state,
+                "baseRef": {"branchProtectionRule": None}}}}})
+        elif "/rules/branches/" in command[2]:
+            raise subprocess.CalledProcessError(
+                1, command, stderr=f"gh: {body} (HTTP {http_status})")
+        else:  # check-runs / statuses / pulls reads of the normal path
+            stdout = "{}"
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+    monkeypatch.setattr(kpa.subprocess, "run", run)
+
+
+def test_feature_gate_403_rules_read_accepts_merged_publication(monkeypatch):
+    """The paywall 403 means 'no rules are configured': with no required checks
+    visible, acceptance falls back to publication — gh pr view must report
+    state=MERGED with a mergeCommit, and the receipt accepts, not `auth`."""
+    calls = []
+    _gh_mock(monkeypatch, calls=calls)
+    receipt = kpa.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is True
+    assert receipt["classification"] == "success"
+    assert receipt["head_sha"] == "a" * 40
+    assert receipt["publication"] == {"state": "MERGED", "merge_commit": "c" * 40}
+    assert any(command[1] == "pr" for command in calls)  # publication was actually verified
+
+
+def test_403_without_feature_gate_marker_still_fails_closed_as_auth(monkeypatch):
+    """A plain permissions 403 (no paywall marker) is a real auth failure:
+    classification `auth`, no publication fallback is attempted."""
+    calls = []
+    _gh_mock(monkeypatch, body="Resource not accessible by integration", calls=calls)
+    receipt = kpa.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "auth"
+    assert "HTTP 403" in receipt["detail"]
+    assert "credentials" in receipt["detail"]
+    assert not any(command[1] == "pr" for command in calls)
+
+
+def test_feature_gate_marker_does_not_soften_a_401(monkeypatch):
+    """Even a stderr carrying the paywall text cannot soften a 401: any 401
+    stays an auth failure."""
+    _gh_mock(monkeypatch, http_status=401)
+    receipt = kpa.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "auth"
+    assert "HTTP 401" in receipt["detail"]
+
+
+def test_feature_gate_403_with_open_pr_is_not_accepted(monkeypatch):
+    """Feature-gated rules plus an unmerged PR is not a publication: fail
+    closed with a retryable pending classification, never `auth`."""
+    _gh_mock(monkeypatch, pr_state="OPEN", merge_commit=None)
+    receipt = kpa.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "pending"
+    assert receipt["publication"]["state"] == "OPEN"
+
+
+def test_feature_gate_403_merged_without_merge_commit_fails_closed(monkeypatch):
+    """state=MERGED without a mergeCommit is not a publication either."""
+    _gh_mock(monkeypatch, pr_state="MERGED", merge_commit=None)
+    receipt = kpa.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "missing"
+
+
+@pytest.mark.platforms("linux")
+def test_feature_gated_private_repo_lifecycle_accepts_merged_publication(github):
+    """End to end on the HTTP contract: the rules endpoint answers the paywall
+    403; a MERGED PR completes the card, while the same 403 without the marker
+    still refuses completion as an auth failure."""
+    github.update(no_protection=True, pr_merged=True, rules_refusal=_FEATURE_GATE_BODY)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="feature-gate", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status == "done"
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        assert receipt["ok"] is True and receipt["classification"] == "success"
+        assert receipt["publication"] == {"state": "MERGED", "merge_commit": "c" * 40}
+
+        github.update(rules_refusal="Resource not accessible by integration")
+        tid = kb.create_task(conn, title="plain-403", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        assert receipt["classification"] == "auth"
+        assert "credentials" in (kb.get_task(conn, tid).last_failure_error or "")
