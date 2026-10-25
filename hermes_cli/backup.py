@@ -1121,6 +1121,17 @@ _QUICK_STATE_FILES = (
 
 _QUICK_DEFAULT_KEEP = 20
 
+# #68805 follow-up: when any protected DB is skipped for size, EVERY safety
+# snapshot trips the size cap, the old full suspension of pruning never runs
+# again, and the folder grows without bound (11 x 1-1.7 GB observed in the
+# wild). Size-skips now prune too, with reduced retention, a sole-recoverable
+# state.db guard and a total-size backstop.
+_QUICK_OVERSIZED_KEEP = 2
+# Hard backstop for that reduced prune: total bytes the state-snapshots folder
+# may hold afterwards. Generous next to keep=2 heavy snapshots; exists so the
+# folder cannot exceed it by more than one snapshot's worth of slack.
+_QUICK_OVERSIZED_MAX_TOTAL_BYTES = 4 * 1024**3
+
 
 def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
     home = hermes_home or get_hermes_home()
@@ -1457,27 +1468,41 @@ def _create_quick_snapshot_locked(
     # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
     # with known high-churn safety snapshots (for example pre-update) can pass a
     # smaller keep value so large state.db copies do not accumulate indefinitely.
-    # #68805 review: skip pruning when a present DB failed to capture OR was
-    # skipped for size — either way the snapshot is incomplete and the older
-    # snapshot may contain the only recoverable database.
-    incomplete = failed_dbs or oversized_skipped
-    if not incomplete:
+    # #68805 review: a DB that FAILED to capture still suspends pruning — the
+    # older snapshots may hold the only recoverable database. But a DB skipped
+    # for SIZE alone no longer suspends it: with a multi-GB state.db every
+    # snapshot trips the cap, pruning never runs again, and the folder grows
+    # without bound (#68805 follow-up). Size-skips prune with reduced retention
+    # plus two safety rails: the prune can never end without a surviving
+    # snapshot holding a valid state.db, and the folder total stays capped.
+    if not failed_dbs and not oversized_skipped:
         _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep)
+    elif oversized_skipped:
+        reduced_keep = (
+            _QUICK_OVERSIZED_KEEP if keep is None else min(keep, _QUICK_OVERSIZED_KEEP)
+        )
+        print(
+            "  ⚠ Snapshot: pruning with reduced retention "
+            f"(keep={reduced_keep}) — DB file(s) skipped for size: "
+            + ", ".join(oversized_skipped)
+        )
+        logger.warning(
+            "Quick snapshot skipped oversized DB file(s) %s — pruning with "
+            "reduced keep=%d (sole recoverable state.db protected)",
+            ", ".join(oversized_skipped),
+            reduced_keep,
+        )
+        _prune_quick_snapshots(
+            root,
+            keep=reduced_keep,
+            preserve_last_state_db=True,
+            max_total_bytes=_QUICK_OVERSIZED_MAX_TOTAL_BYTES,
+        )
     else:
-        if oversized_skipped:
-            print(
-                "  ⚠ Skipping snapshot prune: DB file(s) skipped for size: "
-                + ", ".join(oversized_skipped)
-            )
-            logger.warning(
-                "Quick snapshot skipped oversized DB file(s): %s",
-                ", ".join(oversized_skipped),
-            )
         logger.warning(
             "Skipping snapshot prune because %d DB(s) failed to capture "
-            "and/or %d were oversized — preserving older snapshots as "
-            "recovery source",
-            len(failed_dbs), len(oversized_skipped),
+            "— preserving older snapshots as recovery source",
+            len(failed_dbs),
         )
 
     logger.info(
@@ -2044,8 +2069,52 @@ def restore_cron_jobs_all_profiles(
     return restored
 
 
-def _prune_quick_snapshots(root: Path, keep: int = _QUICK_DEFAULT_KEEP) -> int:
-    """Remove oldest quick snapshots beyond the keep limit. Returns count deleted."""
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _snapshot_keeps_valid_state_db(snap_dir: Path) -> bool:
+    """True when *snap_dir* holds a ``state.db`` with a real SQLite header.
+
+    Zeroed or truncated copies cannot be restored, so they do not count as a
+    recoverable database for the pruning guard.
+    """
+    try:
+        with open(snap_dir / "state.db", "rb") as fh:
+            return fh.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER
+    except OSError:
+        return False
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Total size of regular files under *path*; unmeasurable entries count 0."""
+    total = 0
+    for entry in path.rglob("*"):
+        try:
+            if entry.is_file():
+                total += entry.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _prune_quick_snapshots(
+    root: Path,
+    keep: int = _QUICK_DEFAULT_KEEP,
+    *,
+    preserve_last_state_db: bool = False,
+    max_total_bytes: Optional[int] = None,
+) -> int:
+    """Remove oldest quick snapshots beyond the keep limit. Returns count pruned.
+
+    ``preserve_last_state_db``: the prune may never end without at least one
+    surviving snapshot holding a valid ``state.db`` — if none of the retained
+    ones has it, the newest remaining candidate that does is carried forward.
+
+    ``max_total_bytes``: hard backstop applied after the keep cut — oldest
+    survivors are pruned until the folder fits, but the newest snapshot is
+    always kept and the last valid-``state.db`` holder is never sacrificed
+    (recoverability outranks the cap).
+    """
     if not root.exists():
         return 0
 
@@ -2059,13 +2128,51 @@ def _prune_quick_snapshots(root: Path, keep: int = _QUICK_DEFAULT_KEEP) -> int:
         reverse=True,
     )
 
+    survivors = dirs[:keep]
+    doomed = dirs[keep:]
+    if preserve_last_state_db and not any(
+        _snapshot_keeps_valid_state_db(d) for d in survivors
+    ):
+        # Retaining only database-less snapshots would strand the operator:
+        # carry the newest doomed snapshot that still holds a valid state.db.
+        for d in reversed(doomed):
+            if _snapshot_keeps_valid_state_db(d):
+                survivors.append(d)
+                doomed.remove(d)
+                break
+
     deleted = 0
-    for d in dirs[keep:]:
+    for d in doomed:
         try:
             shutil.rmtree(d)
             deleted += 1
         except OSError as exc:
             logger.warning("Failed to prune snapshot %s: %s", d.name, exc)
+
+    if max_total_bytes is not None:
+        while len(survivors) > 1:
+            if sum(_dir_size_bytes(d) for d in survivors) <= max_total_bytes:
+                break
+            # Oldest droppable survivor; index 0 is the newest — never dropped.
+            drop_idx = None
+            for idx in range(len(survivors) - 1, 0, -1):
+                if preserve_last_state_db and _snapshot_keeps_valid_state_db(
+                    survivors[idx]
+                ):
+                    rest = survivors[:idx] + survivors[idx + 1 :]
+                    if not any(_snapshot_keeps_valid_state_db(s) for s in rest):
+                        continue  # sole recoverable state.db — untouchable
+                drop_idx = idx
+                break
+            if drop_idx is None:
+                break  # nothing droppable without losing the recovery floor
+            try:
+                shutil.rmtree(survivors[drop_idx])
+            except OSError as exc:
+                logger.warning("Failed to prune snapshot %s: %s", survivors[drop_idx].name, exc)
+                break
+            survivors.pop(drop_idx)
+            deleted += 1
 
     return deleted
 
