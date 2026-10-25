@@ -17,6 +17,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
+from utils import rmtree_readonly
 
 
 def _kanban_config() -> dict:
@@ -304,13 +305,13 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
-    import shutil
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
     if event_days < 0 or log_days < 0:
         return _err("kanban gc: retention days must be >= 0 (0 disables that sweep)", 2)
     scratch_root = kb.workspaces_root()
     removed_ws = 0
+    failed_ws: list[tuple[str, Path, OSError]] = []
     with kbc.connect_closing() as conn:
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
@@ -339,7 +340,14 @@ def _cmd_gc(args: argparse.Namespace) -> int:
                 continue
             if kbw._defer_shared_workspace_cleanup(conn, row["id"], path):
                 continue
-            shutil.rmtree(path, ignore_errors=True)
+            # Read-only files (git object stores from repo clones) silently
+            # survived rmtree(ignore_errors=True), and every later gc skipped
+            # the leftover again: chmod-retry via the shared helper, and keep
+            # whatever still refuses to go for the honest report below.
+            try:
+                rmtree_readonly(path)
+            except OSError as exc:
+                failed_ws.append((row["id"], path, exc))
             if not path.exists():
                 removed_ws += 1
 
@@ -348,8 +356,14 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         with kbc.connect_closing() as conn:
             removed_events = kb.gc_events(conn, older_than_seconds=event_days * 24 * 3600)
     removed_logs = kb.gc_worker_logs(older_than_seconds=log_days * 24 * 3600) if log_days else 0
+    for tid, ws_path, exc in failed_ws:
+        errno = getattr(exc, "errno", None)
+        prefix = f"[Errno {errno}] " if errno else ""
+        print(f"kanban gc: workspace {tid} NOT removed ({ws_path}): "
+              f"{prefix}{exc.strerror or exc}", file=sys.stderr)
+    failed_note = f", {len(failed_ws)} workspace(s) failed" if failed_ws else ""
     print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+          f"{removed_events} event row(s), {removed_logs} log file(s) removed{failed_note}")
     return 0
 
 
