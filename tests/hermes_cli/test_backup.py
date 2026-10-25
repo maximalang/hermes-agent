@@ -1836,6 +1836,33 @@ class TestQuickSnapshot:
         assert remaining == [names[-1]]
         assert (newest / "state.db").exists()
 
+    def test_non_oversized_prune_keeps_default_keep20(self, hermes_home):
+        """Guard for the #68805 follow-up: reduced retention applies ONLY to
+        the oversized branch. A home whose protected DBs stay under the size
+        cap must keep the default keep=20 window — unchanged behavior that
+        must survive this fix (passes on pre-fix code by design).
+        """
+        from hermes_cli.backup import create_quick_snapshot, list_quick_snapshots
+
+        ids = []
+        for i in range(23):
+            snap_id = create_quick_snapshot(label=f"full{i}", hermes_home=hermes_home)
+            assert snap_id is not None
+            ids.append(snap_id)
+            _advance_backup_clock()
+
+        remaining = {
+            s["id"] for s in list_quick_snapshots(limit=100, hermes_home=hermes_home)
+        }
+        # Exactly the default window survives: 20 newest, the oldest 3 pruned.
+        assert len(remaining) == 20, (
+            f"expected the default keep=20 window, found {len(remaining)}"
+        )
+        assert remaining == set(ids[-20:])
+        # Survivors are complete snapshots: each still holds its state.db copy.
+        for snap_id in ids[-20:]:
+            assert (hermes_home / "state-snapshots" / snap_id / "state.db").exists()
+
 class TestQuickSnapshotProjectsKanban:
     """Regression for #52889: projects.db / kanban.db must survive an upgrade.
 
