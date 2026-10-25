@@ -1708,6 +1708,133 @@ class TestQuickSnapshot:
         )
         assert second_id in snap_ids
 
+    def test_oversized_db_prunes_to_reduced_keep(self, hermes_home):
+        """#68805 follow-up: a permanently oversized state.db must not
+        suspend pruning forever.
+
+        With a multi-GB state.db EVERY safety snapshot trips the size cap,
+        the oversized branch suspends pruning on each run, and the folder
+        grows without bound (11 x 1-1.7 GB observed in the wild). The
+        oversized branch must still prune — with a reduced keep of 2 instead
+        of the default 20 — while the newest recoverable state.db survives.
+        """
+        from hermes_cli.backup import create_quick_snapshot, list_quick_snapshots
+
+        # Four complete snapshots, each holding a real (small) state.db.
+        complete_ids = []
+        for i in range(4):
+            snap_id = create_quick_snapshot(label=f"full{i}", hermes_home=hermes_home)
+            assert snap_id is not None
+            complete_ids.append(snap_id)
+            _advance_backup_clock()
+
+        # Fifth snapshot: state.db exceeds the 1 KB cap -> recorded in
+        # oversized_skipped, small config files still land in the manifest.
+        oversized_id = create_quick_snapshot(
+            label="oversized", hermes_home=hermes_home, max_file_size=1024
+        )
+        assert oversized_id is not None
+        assert not (
+            hermes_home / "state-snapshots" / oversized_id / "state.db"
+        ).exists()
+
+        remaining = {
+            s["id"] for s in list_quick_snapshots(limit=100, hermes_home=hermes_home)
+        }
+        # Reduced retention: exactly the newest two snapshots survive.
+        assert len(remaining) == 2, f"expected 2 snapshots, found {sorted(remaining)}"
+        assert remaining == {oversized_id, complete_ids[-1]}
+        # The newest recoverable state.db is retained.
+        assert (
+            hermes_home / "state-snapshots" / complete_ids[-1] / "state.db"
+        ).exists()
+
+    def test_oversized_prune_keeps_sole_recoverable_state_db(self, hermes_home):
+        """The reduced prune must never strand the only recoverable state.db.
+
+        When none of the count-retained snapshots holds a valid state.db,
+        the newest snapshot that still holds one is carried forward instead
+        of being pruned.
+        """
+        from hermes_cli.backup import create_quick_snapshot, list_quick_snapshots
+
+        # Oldest snapshot: complete — holds the ONLY valid state.db copy.
+        sole_id = create_quick_snapshot(label="sole", hermes_home=hermes_home)
+        assert sole_id is not None
+        assert (hermes_home / "state-snapshots" / sole_id / "state.db").exists()
+        _advance_backup_clock()
+
+        # Newer snapshots without a state.db in the home are complete, but
+        # carry no database, so they cannot serve as a recovery source.
+        (hermes_home / "state.db").unlink()
+        for i in range(3):
+            snap_id = create_quick_snapshot(label=f"lite{i}", hermes_home=hermes_home)
+            assert snap_id is not None
+            assert not (hermes_home / "state-snapshots" / snap_id / "state.db").exists()
+            _advance_backup_clock()
+
+        # Oversized trigger: a state.db bigger than the cap makes the safety
+        # path record oversized_skipped and run the reduced prune.
+        conn = sqlite3.connect(str(hermes_home / "state.db"))
+        conn.execute("CREATE TABLE pad (blob TEXT)")
+        conn.execute("INSERT INTO pad VALUES (?)", ("x" * 4096,))
+        conn.commit()
+        conn.close()
+        oversized_id = create_quick_snapshot(
+            label="oversized", hermes_home=hermes_home, max_file_size=1024
+        )
+        assert oversized_id is not None
+
+        remaining = [
+            s["id"] for s in list_quick_snapshots(limit=100, hermes_home=hermes_home)
+        ]
+        # The sole complete snapshot is older than the reduced keep window
+        # but must survive: it is the only recoverable state.db left.
+        assert sole_id in remaining, (
+            "reduced prune stranded the only recoverable state.db"
+        )
+        assert oversized_id in remaining
+        # The prune still bounded the folder: 2 newest + the guarded one.
+        assert len(remaining) == 3, f"expected 3 snapshots, found {remaining}"
+
+    def test_oversized_prune_total_size_cap_backstop(self, hermes_home):
+        """Hard backstop: after the reduced prune the folder total must fit
+        max_total_bytes — oldest snapshots go first and the newest snapshot
+        is never the one sacrificed to satisfy the cap.
+        """
+        from hermes_cli.backup import _prune_quick_snapshots
+
+        root = hermes_home / "state-snapshots"
+        root.mkdir(parents=True)
+        names = [
+            "20260101-000001",
+            "20260101-000002",
+            "20260101-000003",
+        ]  # oldest..newest
+        for name in names:
+            snap_dir = root / name
+            snap_dir.mkdir()
+            conn = sqlite3.connect(str(snap_dir / "state.db"))
+            conn.execute("CREATE TABLE t (x TEXT)")
+            conn.commit()
+            conn.close()
+            (snap_dir / "filler.bin").write_bytes(b"\0" * 6000)
+
+        def dir_size(snap_dir):
+            return sum(f.stat().st_size for f in snap_dir.rglob("*") if f.is_file())
+
+        newest = root / names[-1]
+        # A cap only the newest snapshot fits under: keep=2 keeps two, then
+        # the backstop has to shed the older one.
+        cap = dir_size(newest) + 1
+
+        deleted = _prune_quick_snapshots(
+            root, keep=2, preserve_last_state_db=True, max_total_bytes=cap
+        )
+        assert deleted == 2, f"expected 2 pruned snapshots, got {deleted}"
+        remaining = sorted(d.name for d in root.iterdir() if d.is_dir())
+        assert remaining == [names[-1]]
+        assert (newest / "state.db").exists()
 
 class TestQuickSnapshotProjectsKanban:
     """Regression for #52889: projects.db / kanban.db must survive an upgrade.
