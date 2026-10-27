@@ -3341,6 +3341,13 @@ def request_review(
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
+            # A successful handoff supersedes any prior failure stamp — mirror
+            # complete_task's reset (_clear_failure_counter). Without this, the
+            # quota-flavored last_failure_error stamped by a rate-limited
+            # requeue (which deliberately never counts a failure) outlives the
+            # run that bounced off the wall, and check_respawn_guard parks the
+            # review lane as blocker_auth forever: its rate_limit_cooldown
+            # branch only fires while the LATEST run is rate_limited (#119070).
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
             params: tuple[Any, ...] = (
                 *(() if reviewer is None else (reviewer,)), task_id,
@@ -3352,7 +3359,9 @@ def request_review(
                    SET status        = 'review',
                        claim_lock    = NULL,
                        claim_expires = NULL,
-                       worker_pid    = NULL
+                       worker_pid    = NULL,
+                       consecutive_failures = 0,
+                       last_failure_error = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
                    AND status IN ('running', 'ready')
