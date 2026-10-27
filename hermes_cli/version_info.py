@@ -58,16 +58,55 @@ def _derived_version(
     return base_version
 
 
+# A git provenance probe must never outlive its timeout by more than a short
+# grace period: a worker bootstrap that wedges here hangs forever (card
+# t_32d98f7f, QA runs 5578/5587).
+_GIT_TIMEOUT_S = 3.0
+_GIT_KILL_GRACE_S = 1.0
+
+
+def _kill_and_reap(process: subprocess.Popen) -> None:
+    """Kill and reap a timed-out git with a hard upper bound.
+
+    ``subprocess.run``'s timeout recovery kills the child but then calls
+    ``communicate()`` with no timeout. On Windows that joins the pipe reader
+    threads, which stay blocked in ``ReadFile`` for as long as ANY descendant
+    of git holds the inherited pipe write ends (fsmonitor daemon, hook,
+    credential helper) — the 3 s timeout turns into an eternal wedge on the
+    startup path. Kill, try to reap within a short grace, and abandon the
+    (daemon) reader threads if a holder outlives the grace: the leaked
+    handles close when the holder exits, and a version probe with no answer
+    is always preferable to a bootstrap that never returns.
+    """
+    try:
+        process.kill()
+        process.communicate(timeout=_GIT_KILL_GRACE_S)
+    except Exception:  # health: allow BLE001 -- must never raise on the startup path
+        pass
+
+
 def _run_git(repo_dir: Path, *args: str) -> str | None:
     try:
-        result = subprocess.run(
-            ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3, cwd=str(repo_dir),
-            check=False,
+        process = subprocess.Popen(
+            ["git", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(repo_dir),
         )
+    except OSError:
+        return None
+    try:
+        stdout, _stderr = process.communicate(timeout=_GIT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _kill_and_reap(process)
+        return None
     except (OSError, subprocess.SubprocessError):
         return None
-    value = (result.stdout or "").strip()
-    return value if result.returncode == 0 and value else None
+    value = (stdout or "").strip()
+    return value if process.returncode == 0 and value else None
 
 
 def _resolve_repo_dir() -> Path | None:
@@ -214,28 +253,19 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
     commit_date: int | None = None
     if commit_date_raw and commit_date_raw.isdigit():
         commit_date = int(commit_date_raw)
-    try:
-        # -uno: skip the untracked-file scan. This runs on the startup-banner
-        # path, and a full working-tree walk costs real time on large or cold
-        # checkouts. Same semantics as write_install_stamp.py.
-        # The 3 s timeout kills a slow status (a partial clone lazily fetching a tree, a cold or
-        # scanned disk), and a status killed while refreshing the index strands .git/index.lock:
-        # the update's own merge then dies on "File exists" (#132089). A read-only probe takes
-        # no optional lock.
-        status_command = ["git", "--no-optional-locks", "status", "--porcelain"]
-        if not include_untracked:
-            status_command.append("-uno")
-        dirty_result = subprocess.run(
-            status_command,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=3,
-            cwd=str(repo_dir),
-            check=False,
-        )
-        dirty = dirty_result.returncode == 0 and bool((dirty_result.stdout or "").strip())
-    except (OSError, subprocess.SubprocessError):
-        dirty = False
+    # -uno: skip the untracked-file scan. This runs on the startup-banner
+    # path, and a full working-tree walk costs real time on large or cold
+    # checkouts. Same semantics as write_install_stamp.py.
+    # A slow status (a partial clone lazily fetching a tree, a cold or scanned disk) falls to the
+    # _run_git timeout instead: killed before it can strand .git/index.lock while refreshing the
+    # index (the update's own merge then dies on "File exists", #132089), and a killed status
+    # cannot wedge the startup path even when a git child holds the pipes. A read-only probe
+    # takes no optional lock.
+    status_args = ["--no-optional-locks", "status", "--porcelain"]
+    if not include_untracked:
+        status_args.append("-uno")
+    # dirty == exit 0 with at least one entry, exactly _run_git's truthiness.
+    dirty = _run_git(repo_dir, *status_args) is not None
 
     tags = _run_git(repo_dir, "tag", "--merged", "HEAD", "--list", "v[0-9]*")
     releases = [
