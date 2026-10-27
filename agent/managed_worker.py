@@ -13,6 +13,7 @@ except ModuleNotFoundError as exc:
         raise
 
 import contextlib
+import importlib
 import json
 import logging
 import os
@@ -20,6 +21,56 @@ import re
 from pathlib import Path
 import sys
 import threading
+
+# Empirical Windows bootstrap ordering (t_d4350193): importing numpy from inside the
+# plugin loader wedged every bootstrap in the OpenBLAS DLL init (native py-spy stacks,
+# CPU 0%); OPENBLAS_NUM_THREADS=1 alone did NOT lift it (canary 5426 wedged with the pin
+# confirmed in the child env). The same import in a fresh process completes in 0.1 s
+# (verified standalone, below-normal priority, same env venv). So warm heavy modules
+# HERE, in the module body — which runs before execute() starts the worker's reader
+# threads — and later plugin imports reuse sys.modules without a second DLL load.
+#
+# CONTRACT (t_dc7c5148): heavy native DLLs load only BEFORE reader threads exist. A
+# C-extension import holds the Windows loader lock for its DllMain, and a DllMain may
+# itself wait on thread sync (OpenBLAS builds its pool from DllMain); a reader thread
+# holding that sync while wanting the loader lock is an ABBA wedge at CPU 0% (py-spy,
+# run 5417). The t_dc7c5148 audit put every post-reader heavy import on three paths:
+# plugin discovery (hermes_cli.plugins — its own background thread), the memory-provider
+# loader (catalog providers lazily pull sentence_transformers → numpy/torch), and
+# function-level imports in voice/wake-word tools (numpy, sherpa_onnx). Prewarm is a
+# configurable list so an operator can cover a new heavy module without a code change:
+# HERMES_WORKER_PREWARM_MODULES is comma/space separated, defaults to numpy, and an
+# empty value disables prewarm entirely. Every entry is optional — a missing module
+# stays non-fatal (the plugin runs without it), anything else is logged, never fatal,
+# and left to the plugin's own import handling. A plugin importing another heavy DLL
+# (scipy/torch/onnx) must be added to this list by its gateway env, or it accepts the
+# documented loader-lock risk of a lazy first load after the reader threads start.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")  # one BLAS thread is enough for a worker; setdefault lets an operator raise it
+
+PREWARM_MODULES_ENV = "HERMES_WORKER_PREWARM_MODULES"
+PREWARM_MODULES_DEFAULT = "numpy"
+
+
+def _prewarm_module_names(raw):
+    """Parse the prewarm list: ``None`` → the default (numpy), ``''`` → disabled,
+    else comma/space separated module names, de-duplicated in declaration order."""
+    names, seen = [], set()
+    for token in re.split(r"[,\s]+", (raw if raw is not None else PREWARM_MODULES_DEFAULT).strip()):
+        if token and token not in seen:
+            seen.add(token)
+            names.append(token)
+    return names
+
+
+for _prewarm_name in _prewarm_module_names(os.environ.get(PREWARM_MODULES_ENV)):
+    try:  # prewarm: finish the DLL init before execute() starts the reader threads
+        importlib.import_module(_prewarm_name)
+    except ImportError:
+        pass
+    except Exception:
+        logging.getLogger("agent.managed_worker").warning(
+            "%s prewarm failed; worker continues without it", _prewarm_name, exc_info=True
+        )
 
 logger = logging.getLogger(__name__)
 
