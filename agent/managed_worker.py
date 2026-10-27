@@ -13,6 +13,7 @@ except ModuleNotFoundError as exc:
         raise
 
 import contextlib
+import importlib
 import json
 import logging
 import os
@@ -20,6 +21,56 @@ import re
 from pathlib import Path
 import sys
 import threading
+
+# Empirical Windows bootstrap ordering (t_d4350193): importing numpy from inside the
+# plugin loader wedged every bootstrap in the OpenBLAS DLL init (native py-spy stacks,
+# CPU 0%); OPENBLAS_NUM_THREADS=1 alone did NOT lift it (canary 5426 wedged with the pin
+# confirmed in the child env). The same import in a fresh process completes in 0.1 s
+# (verified standalone, below-normal priority, same env venv). So warm heavy modules
+# HERE, in the module body — which runs before execute() starts the worker's reader
+# threads — and later plugin imports reuse sys.modules without a second DLL load.
+#
+# CONTRACT (t_dc7c5148): heavy native DLLs load only BEFORE reader threads exist. A
+# C-extension import holds the Windows loader lock for its DllMain, and a DllMain may
+# itself wait on thread sync (OpenBLAS builds its pool from DllMain); a reader thread
+# holding that sync while wanting the loader lock is an ABBA wedge at CPU 0% (py-spy,
+# run 5417). The t_dc7c5148 audit put every post-reader heavy import on three paths:
+# plugin discovery (hermes_cli.plugins — its own background thread), the memory-provider
+# loader (catalog providers lazily pull sentence_transformers → numpy/torch), and
+# function-level imports in voice/wake-word tools (numpy, sherpa_onnx). Prewarm is a
+# configurable list so an operator can cover a new heavy module without a code change:
+# HERMES_WORKER_PREWARM_MODULES is comma/space separated, defaults to numpy, and an
+# empty value disables prewarm entirely. Every entry is optional — a missing module
+# stays non-fatal (the plugin runs without it), anything else is logged, never fatal,
+# and left to the plugin's own import handling. A plugin importing another heavy DLL
+# (scipy/torch/onnx) must be added to this list by its gateway env, or it accepts the
+# documented loader-lock risk of a lazy first load after the reader threads start.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")  # one BLAS thread is enough for a worker; setdefault lets an operator raise it
+
+PREWARM_MODULES_ENV = "HERMES_WORKER_PREWARM_MODULES"
+PREWARM_MODULES_DEFAULT = "numpy"
+
+
+def _prewarm_module_names(raw):
+    """Parse the prewarm list: ``None`` → the default (numpy), ``''`` → disabled,
+    else comma/space separated module names, de-duplicated in declaration order."""
+    names, seen = [], set()
+    for token in re.split(r"[,\s]+", (raw if raw is not None else PREWARM_MODULES_DEFAULT).strip()):
+        if token and token not in seen:
+            seen.add(token)
+            names.append(token)
+    return names
+
+
+for _prewarm_name in _prewarm_module_names(os.environ.get(PREWARM_MODULES_ENV)):
+    try:  # prewarm: finish the DLL init before execute() starts the reader threads
+        importlib.import_module(_prewarm_name)
+    except ImportError:
+        pass
+    except Exception:
+        logging.getLogger("agent.managed_worker").warning(
+            "%s prewarm failed; worker continues without it", _prewarm_name, exc_info=True
+        )
 
 logger = logging.getLogger(__name__)
 
@@ -33,27 +84,31 @@ RESULT_FIELDS = ('final_response', 'failed', 'interrupted', 'completed', 'partia
                  'cache_read_tokens', 'cache_write_tokens', 'reasoning_tokens',
                  'estimated_cost_usd', 'cost_status', 'cost_source', 'service_tier', 'failure_reason',
                  'session_id', 'requested_model', 'served_model', '_turn_input_tokens', '_turn_output_tokens',
-                 'billing_block')
-# ``billing_block`` (``agent/billing_links.BillingBlock`` plus ``unverified``) is the one structured field.
+                 'failure_retryable', 'failure_resets_at', 'billing_block', 'free_tier', 'usage_window_message')
+# The structured fields and their allowed keys: ``billing_block`` (``agent/billing_links.BillingBlock``
+# plus ``unverified``) and ``free_tier`` (``agent/turn_recovery._stamp_free_tier``). With
+# ``failure_reason``, ``failure_retryable`` and ``failure_resets_at`` they are what
+# ``agent.error_surface.build_error_surface_from_result`` reads for the owner's error card.
 BILLING_FIELDS = ('provider', 'provider_label', 'model', 'billing_url', 'is_nous', 'message', 'unverified')
+STRUCTURED_FIELDS = {'billing_block': BILLING_FIELDS, 'free_tier': ('kind', 'message')}
 
 
 def _scalar(value):
     return value is None or type(value) in (bool, int, float) or (isinstance(value, str) and len(value) <= 4096)
 
 
-def _billing_block(value):
-    return isinstance(value, dict) and not set(value) - set(BILLING_FIELDS) and all(map(_scalar, value.values()))
+def _structured(key, value):
+    return isinstance(value, dict) and not set(value) - set(STRUCTURED_FIELDS[key]) and all(map(_scalar, value.values()))
 
 
 def result_frame(result):
     """Worker side: the receipt fields of ``run_conversation``'s result, scalars only, text bounded."""
     frame = {k: (v[:4096] if isinstance(v, str) and k != 'final_response' else v) for k, v in result.items()
-             if k in RESULT_FIELDS and k != 'billing_block' and (v is None or type(v) in (bool, int, float, str))}
-    block = result.get('billing_block')
-    if isinstance(block, dict):
-        frame['billing_block'] = {k: v[:4096] if isinstance(v, str) else v for k, v in block.items()
-                                  if k in BILLING_FIELDS and (v is None or type(v) in (bool, int, float, str))}
+             if k in RESULT_FIELDS and k not in STRUCTURED_FIELDS and (v is None or type(v) in (bool, int, float, str))}
+    for key, fields in STRUCTURED_FIELDS.items():
+        if isinstance(block := result.get(key), dict):
+            frame[key] = {k: v[:4096] if isinstance(v, str) else v for k, v in block.items()
+                          if k in fields and (v is None or type(v) in (bool, int, float, str))}
     return frame
 
 
@@ -61,13 +116,15 @@ def accept_result(result):
     """Owner side of the worker's result frame: ``(result, usage)`` in the in-process turn's shape
     (gateway projection: prompt/completion tokens as input/output), or ValueError."""
     if (not isinstance(result, dict) or set(result) - set(RESULT_FIELDS) or not isinstance(result.get('final_response'), str)
-            or result.get('billing_block') is not None and not _billing_block(result['billing_block'])
-            or any(not _scalar(value) for key, value in result.items() if key not in ('final_response', 'billing_block'))):
+            or any(result.get(key) is not None and not _structured(key, result[key]) for key in STRUCTURED_FIELDS)
+            or any(not _scalar(value) for key, value in result.items()
+                   if key != 'final_response' and key not in STRUCTURED_FIELDS)):
         raise ValueError('invalid_worker_result')
     accepted = dict(result)
-    if accepted.get('billing_block') is None:
-        # Every failure other than a billing wall carries no block.
-        accepted.pop('billing_block', None)
+    for key in STRUCTURED_FIELDS:
+        if accepted.get(key) is None:
+            # A failure other than a billing wall or a free-tier refusal carries no block.
+            accepted.pop(key, None)
     turn_in, turn_out = accepted.pop('_turn_input_tokens', None), accepted.pop('_turn_output_tokens', None)
     if any(value is not None and (type(value) is not int or value < 0) for value in (turn_in, turn_out)):
         raise ValueError('invalid_worker_result')
@@ -391,7 +448,9 @@ def execute(frame, channel):
                 frame = {**frame, 'text': content}
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
-            result = run_worker_turns(agent, frame, history)
+            # Most failed results name no provider or model; the owner's error card needs the agent's.
+            result = {'provider': getattr(agent, 'provider', None), 'model': getattr(agent, 'model', None),
+                      **run_worker_turns(agent, frame, history)}
             result['_turn_input_tokens'] = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
             result['_turn_output_tokens'] = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
             retire_agent(agent)
