@@ -30,6 +30,7 @@ from agent.auxiliary_client import (
     call_llm,
     extract_content_or_reasoning,
 )
+from agent.auxiliary_task_config import _get_auxiliary_task_config
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.context_compressor_prellm import PreLlmSkipMixin
 from agent.context_compressor_window import CompactionWindowMixin
@@ -250,6 +251,28 @@ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
 def _exc_status_code(exc: Exception) -> Any:
     """HTTP status carried on the exception itself or on its ``response``."""
     return getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def _compression_main_agent_fallback_disabled() -> bool:
+    """True when ``auxiliary.compression`` pins an explicit provider AND ``main_agent_fallback: false``.
+
+    The compressor owns a second, independent route to the main agent model: ``_on_summary_failure``
+    retries the summary once on ``self.model`` after an aux failure. The auxiliary client's own
+    no-fallback directive (``_main_agent_fallback_disabled``) only guards ITS rung of the ladder, so
+    without this mirror a pinned auxiliary rail still silently borrowed the (paid) main agent model
+    through the compressor's retry (live incident 28.10: 240 summary_auth_failure telemetry rows on
+    aux=glm-5.3 — the session's MAIN model — behind compression lanes pinned elsewhere). Same
+    condition as the client gate: an auto/unset provider is never gated (there is no pin to honor),
+    and an unset/true flag keeps the upstream last-resort retry.
+    """
+    try:
+        task_config = _get_auxiliary_task_config("compression")
+    except Exception:  # config/plugin discovery failure must not disable the retry
+        return False
+    provider = str(task_config.get("provider") or "").strip().lower()
+    if provider in {"", "auto"}:
+        return False
+    return task_config.get("main_agent_fallback") is False
 
 
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
@@ -4137,9 +4160,20 @@ Write only the summary body. Do not include any preamble or prefix."""
             self.summary_model or getattr(self, "_last_aux_resolved_model", "") or ""
         ).strip()
         if _route_model and _route_model != self.model and not getattr(self, "_summary_model_fallen_back", False):
-            self._fallback_to_main_for_compression(e, kind.fallback_reason(), failed_model=_route_model)
-            # Retry immediately on the main model.
-            return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
+            if _compression_main_agent_fallback_disabled():
+                # Owner no-fallback directive (auxiliary.compression.main_agent_fallback=false with a
+                # pinned provider): the compressor must not borrow the main agent model either. Fall
+                # through to the cooldown/terminal-flag path so compression fails cleanly instead.
+                logger.warning(
+                    "Summary model '%s' %s (%s). Main-model fallback disabled "
+                    "(auxiliary.compression.main_agent_fallback=false); compression fails without "
+                    "main model '%s'.",
+                    _route_model, kind.fallback_reason(), e, self.model,
+                )
+            else:
+                self._fallback_to_main_for_compression(e, kind.fallback_reason(), failed_model=_route_model)
+                # Retry immediately on the main model.
+                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic, memory_context=memory_context)
 
         # Transient errors: short cooldown for JSON-decode/streaming-closed/empty-content. Timeouts escalate
         # 60s→300s→900s (structural repeat offenders) and take precedence over the short rung; truncation

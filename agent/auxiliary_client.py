@@ -3789,20 +3789,26 @@ def _prepare_same_provider_retry(
     return retry_client, retry_kwargs
 
 
-def _retry_same_provider_sync(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str], **prep) -> Any:
+def _retry_same_provider_sync(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str],
+                              failed_key_box: Optional[list] = None, **prep) -> Any:
     retry_client, retry_kwargs = _prepare_same_provider_retry(
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=False, **prep,
     )
+    if failed_key_box is not None:
+        failed_key_box[:] = [str(getattr(retry_client, "api_key", "") or "")]
     return _validate_llm_response(
         _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode), task,
     )
 
 
-async def _retry_same_provider_async(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str], **prep) -> Any:
+async def _retry_same_provider_async(*, resolved_provider: str, resolved_api_mode: Optional[str], task: Optional[str],
+                                     failed_key_box: Optional[list] = None, **prep) -> Any:
     import asyncio
     retry_client, retry_kwargs = _prepare_same_provider_retry(
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=True, **prep,
     )
+    if failed_key_box is not None:
+        failed_key_box[:] = [str(getattr(retry_client, "api_key", "") or "")]
     return await asyncio.to_thread(
         _validate_llm_response,
         await _relay_async_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
@@ -7513,9 +7519,14 @@ def _prepare_aux_request(
 
 class _LadderStep(NamedTuple):
     """A provider request the ladder asks its driver to perform. kind: "call" (client, kwargs) |
-    "retry_same_provider" (provider, model) | "fallback" (fb_client, fb_model, fb_label)."""
+    "retry_same_provider" (provider, model) | "fallback" (fb_client, fb_model, fb_label).
+
+    ``failed_key_box`` (retry steps only) is a per-call mutable box the performer fills with the
+    api key of the client it actually rebuilt, so a failing retry can bench exactly that pool
+    entry even when a concurrent process rotated the pool underneath (#132284-class walk)."""
     kind: str
     args: tuple
+    failed_key_box: Optional[list] = None
 
 
 # Ordered (predicate, reason) pairs for the provider-fallback rung: first match
@@ -7563,6 +7574,13 @@ def _param_rung_accepts(exc: Exception) -> bool:
 
 def _credential_rung_accepts(exc: Exception) -> bool:
     return _is_auth_error(exc) or _is_payment_error(exc) or _is_rate_limit_error(exc)
+
+
+# Safety cap for the same-provider pool walk: one retry per eligible entry, bounded so a
+# pathological rotation that never runs dry (marking that never sticks, a fast-growing pool)
+# cannot spin a single auxiliary call forever. Real pools are far smaller (gpt-free n=3,
+# switcher n=11).
+_POOL_WALK_MAX_STEPS = 12
 
 
 # Immutable route context shared by the recovery rungs.
@@ -7761,28 +7779,46 @@ def _ladder_credential_rungs(
     # is skipped and ``first_err`` is handed to the provider-fallback chain as-is.
     if pool_provider and _credential_rung_accepts(first_err):
         recovery_err = first_err
-        # Skip the extra retry for clear payment/quota errors — the endpoint won't accept
-        # another request with the same exhausted key.
+        failed_key = _client_api_key
+        # One extra retry on the ORIGINAL client for a possibly-transient 429. Payment/quota
+        # errors skip it: the endpoint won't accept another request with the same exhausted key.
         if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
             resp, recovery_err = yield from _rung(
                 _LadderStep("call", (client, kwargs)), _credential_rung_accepts)
             if recovery_err is None:
                 return resp, None
-        if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
+        # Walk the pool, not one hop: each eligible entry gets exactly one retry (fill_first
+        # order comes from the pool's rotation), so a healthy sibling behind two exhausted
+        # accounts serves THIS call instead of surf "no available entries" (#132284-class).
+        # Every bench is bound to the credential that actually served the failing request —
+        # the performer-recorded rebuilt key — so a concurrent rotation can never bench an
+        # untried entry. The cap guards against a rotation that never runs dry.
+        steps = 0
+        while steps < _POOL_WALK_MAX_STEPS:
+            first_err = recovery_err
+            if not _recover_provider_pool(pool_provider, recovery_err, failed_api_key=failed_key):
+                break
+            steps += 1
             logger.info("Auxiliary %s%s: recovered %s via credential-pool rotation after %s",
                         task or "call", tag, pool_provider, type(recovery_err).__name__)
+            retry_key_box: list[str] = []
             try:
                 return (yield _LadderStep(
-                    "retry_same_provider", (resolved_provider, route.resolved_model))), None
+                    "retry_same_provider", (resolved_provider, route.resolved_model),
+                    failed_key_box=retry_key_box)), None
             except Exception as retry2_err:
-                # Rotated key also hit a wall: mark it now so concurrent processes skip it,
-                # then fall through to the provider fallback.
                 if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                         or _is_rate_limit_error(retry2_err)):
-                    _recover_provider_pool(pool_provider, retry2_err)
-                    first_err = retry2_err
-                else:
-                    raise
+                    # The rotated-to credential also hit a wall: bench exactly the entry that
+                    # served this retry, then continue to the next eligible entry. Without a
+                    # recorded identity keep the previous hint — never bench blind.
+                    failed_key = retry_key_box[0] if retry_key_box else failed_key
+                    recovery_err = retry2_err
+                    continue
+                raise
+        else:
+            logger.warning("Auxiliary %s%s: credential-pool walk hit the %d-step safety cap for %s",
+                           task or "call", tag, _POOL_WALK_MAX_STEPS, pool_provider)
     return None, first_err
 
 
@@ -8113,7 +8149,10 @@ def _ladder_step_call(
         return "call", step.args, dict(provider=req.resolved_provider, api_mode=req.resolved_api_mode)
     if step.kind == "retry_same_provider":
         retry_provider, retry_model = step.args
-        return "retry", (), dict(retry_kwargs, resolved_provider=retry_provider, resolved_model=retry_model)
+        return "retry", (), dict(
+            retry_kwargs, resolved_provider=retry_provider, resolved_model=retry_model,
+            failed_key_box=step.failed_key_box,
+        )
     return "fallback", step.args, candidate_kwargs
 
 
