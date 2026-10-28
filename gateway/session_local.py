@@ -24,11 +24,21 @@ class LocalSessionAdapter(BasePlatformAdapter):
     def __init__(self, authority):
         super().__init__(PlatformConfig(enabled=True), Platform.LOCAL)
         self.authority = authority
+        # Built outside ``_create_adapter``: without its runner a push wake skips the authority FIFO
+        # and falls to a message handler this adapter never has (``deliver_wake``).
+        self.gateway_runner = getattr(authority, 'runner', None)
         self.sources = {}
         self.policies = {}
 
+    @staticmethod
+    def _source_key(source):
+        # A conversation its chat moved past keeps the chat's id, which every other one of that chat
+        # shares: its own key names it (gateway/session_detached.py).
+        from gateway.session_detached import detached_route_of
+        return detached_route_of(source) or source.chat_id
+
     def authorize_source(self, source):
-        saved = self.sources.get(source.chat_id)
+        saved = self.sources.get(self._source_key(source))
         if saved is None:
             return False
         original, identity = saved
@@ -40,7 +50,7 @@ class LocalSessionAdapter(BasePlatformAdapter):
         return source.platform, source.chat_id, source.user_id, source.profile, source.chat_type
 
     def register_source(self, source):
-        self.sources[source.chat_id] = source, self._identity(source)
+        self.sources[self._source_key(source)] = source, self._identity(source)
 
     async def connect(self, *, is_reconnect=False):
         return True
@@ -115,8 +125,8 @@ class LocalSessionAdapter(BasePlatformAdapter):
 
 
 def authorize_local_source(runner, source):
-    """None for legacy/nonlocal routes; registered local adapters fail closed."""
-    if source.platform != Platform.LOCAL:
+    """None for legacy/nonlocal routes and history mounts; registered local adapters fail closed."""
+    if source is None or source.platform != Platform.LOCAL:
         return None
     # A forged profile must not miss this adapter and fall into a messaging
     # allow-all policy. Local source identity is owned by this authority alone.
@@ -235,14 +245,6 @@ def staged_creation_follows(authority, actor, request_id):
     return isinstance(request, dict) and request.get('follow_profile_config') is True
 
 
-def _welcome_trial_model():
-    """The free model for a chat that has no configured one, while the welcome trial carries this
-    activity (the local Desktop, a claimed guest): what the agent pins on the welcome host anyway
-    (``anon_auth.pin_model_for_route``). Else None, and the create refuses."""
-    from hermes_cli import anon_auth
-    return anon_auth.GUEST_MODEL if anon_auth.free_inference_active() else None
-
-
 def stage_local_session(authority, actor, params, *, trusted_policy=None, trusted_secrets=None, skills_prompt=None,
                         client_local=False, desktop_local=False):
     """Everything before the creation commit: the existing session's ref on an exact retry, else the
@@ -255,7 +257,7 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
         raise RuntimeStoreError('profile_mismatch')
     if 'session:create' not in actor.capabilities:
         raise RuntimeStoreError('permission_denied')
-    from gateway.session_policy import build_policy, BYPASS_FIELDS
+    from gateway.session_policy import build_policy, BYPASS_FIELDS, FOLLOW_ADOPTED, LOCAL_DESKTOP_CHAT
     from gateway.run import _resolve_gateway_model
     from dataclasses import replace
     private_secrets = dict(trusted_secrets or {})
@@ -282,12 +284,16 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
             policy = replace(policy, request_json=json.dumps(
                 {**json.loads(policy.request_json), 'model_requested': raw_model, 'route_derived': derived},
                 sort_keys=True))
-        if desktop_local and policy.source == 'gui':
-            import json
-            policy = replace(policy, request_json=json.dumps(
-                {**json.loads(policy.request_json), 'desktop_local': True}, sort_keys=True))
+        marks = {LOCAL_DESKTOP_CHAT: True} if desktop_local and policy.source == 'gui' else {}
         if policy.model is None:
-            policy = replace(policy, model=_resolve_gateway_model(policy.config()) or _welcome_trial_model())
+            from hermes_cli.anon_auth import GUEST_MODEL
+            policy = replace(policy, model=_resolve_gateway_model(policy.config()) or None)
+            if policy.model == GUEST_MODEL:
+                # Follows its profile, so the provider the user connects later replaces the trial model.
+                marks[FOLLOW_ADOPTED] = True
+        if marks:
+            import json
+            policy = replace(policy, config_json=json.dumps({**json.loads(policy.config_json), **marks}))
     request_id = params.get('request_id', uuid.uuid4().hex)
     if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
         raise RuntimeStoreError('invalid_params', field='request_id',
@@ -423,7 +429,11 @@ def local_session_info(authority, ref):
     from gateway.session_authorities import served_profile_name
     from gateway.session_policy import policy_for_source
     policy = policy_for_source(authority.runner, live.source)
-    info = {'source': policy.source if policy else live.source.platform.value,
+    if live.source is None:  # a history mount: what its stored row says
+        source = authority.db.get_session(ref.session_id)['source']
+    else:
+        source = policy.source if policy else live.source.platform.value
+    info = {'source': source,
             'model': (getattr(agent, 'model', policy.current_model(authority) if policy else None) if agent is not None
                       else _lazy_model(authority, policy)),
             'lazy': agent is None,
@@ -436,7 +446,7 @@ def local_session_info(authority, ref):
     peek = getattr(authority.runner, '_peek_session_state', None)
     state = peek(live.route) if peek is not None else None
     override = state.conversation.reasoning_override if state is not None else None  # a typed /reasoning
-    if agent is None and policy is None and live.source.platform != Platform.LOCAL:
+    if agent is None and policy is None and live.source is not None and live.source.platform != Platform.LOCAL:
         # A messaging chat not built yet: what its next turn resolves (its /model and /reasoning picks
         # included), so a viewer's model and reasoning pill never wait on a field that never comes.
         from gateway.session_messaging_picks import messaging_route_info
