@@ -50,7 +50,7 @@ def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
 
 @pytest.mark.parametrize(
     "rc, event, failure_counted",
-    [(0, "protocol_violation", False), (kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limited", False)],
+    [(0, "protocol_violation", False), (kb.KANBAN_RATE_LIMIT_EXIT_CODE, "infrastructure_blocked", False)],
 )
 def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, failure_counted):
     """Empty reap registry + exit trailer in the log: a clean exit is the protocol violation
@@ -70,7 +70,7 @@ def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, 
         task = kb.get_task(conn, tid)
         assert ev["kind"] == event
         assert "not alive" not in (run["error"] or "")
-        assert task.status == "ready"
+        assert task.status == ("ready" if rc == 0 else "blocked")
         assert task.consecutive_failures == (1 if failure_counted else 0)
         # The decoded rc lands in the run row so quota (75) vs crash stays tellable after
         # the fact even though the worker_output tail is trimmed (#113611).
@@ -80,7 +80,7 @@ def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, 
             assert kbd._protocol_violation_streak(conn, tid) == 1
             assert KANBAN_WORKER_EXIT_TRAILER not in (run["error"] or "")
         else:
-            assert run["outcome"] == "rate_limited"
+            assert run["outcome"] == "infrastructure_blocked"
 
 
 def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):

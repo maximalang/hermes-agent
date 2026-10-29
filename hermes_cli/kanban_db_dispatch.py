@@ -271,7 +271,8 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
         raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
     except Exception:
         return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
+    from hermes_cli.kanban_failure_policy import RUN_START
+    matches = _EXIT_TRAILER_RE.findall((raw or "").rsplit("\n" + RUN_START, 1)[-1])
     return int(matches[-1]) if matches else None
 
 
@@ -1154,6 +1155,7 @@ class _CrashSweep:
     """Everything ``detect_crashed_workers`` collects inside its reclaim txn."""
 
     crashed: list[str] = field(default_factory=list)
+    infrastructure_blocked: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
@@ -1168,7 +1170,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1194,7 +1196,15 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
+            from hermes_cli.kanban_failure_policy import dead_worker_cause, park_infrastructure, held_exit_payload
+            cause = dead_worker_cause(dead, row["id"], row["current_run_id"], board)
+            if cause and park_infrastructure(conn, row["id"], cause, outcome=dead.run_outcome,
+                                             error=dead.error_text, metadata=dead.event_payload):
+                sweep.infrastructure_blocked.append(row["id"])
+                sweep.exited_hook_payloads.append(held_exit_payload(row, dead))
+                continue
             retry_status = _kb._retry_status_for_run(conn, row["id"])
+            dead.event_payload["failure_class"] = "task"
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -1286,20 +1296,6 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                     "protocol_violation_limit": violation_limit,
                 },
             )
-        elif dead.terminal_provider:
-            # A retry cannot heal a revoked credential or a missing model, so
-            # the whole ``failure_limit`` budget would be spent on identical
-            # failures. ``force_trip`` blocks now, sticky: ``recompute_ready``
-            # must not auto-resume it before the operator fixes the provider.
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
-                force_trip=True,
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "claimer": claimer, "terminal_provider": True},
-            )
         else:
             is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
             extra = {"pid": pid, "claimer": claimer}
@@ -1332,7 +1328,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     """
     sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
-    auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    auto_blocked = sweep.infrastructure_blocked + _account_crashes(conn, sweep.crash_details)
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # requeues did NOT count a failure and are NOT crashes.
@@ -1394,16 +1390,17 @@ def _record_task_failure(
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
     unconditionally (caller applied its own bounded-retry policy).
 
-    ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
-    #114720) — nothing about the card ran, so the run and event are recorded
-    with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
-    the breaker never trips; the card stays retryable and
-    :func:`check_respawn_guard` spaces the retries.
+    Known infrastructure failures hold the card with typed evidence and a
+    deduped remediation item, without touching the task retry counter.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    from hermes_cli.kanban_failure_policy import classify_infrastructure, park_infrastructure
+    cause = classify_infrastructure(error if outcome == "spawn_failed" else "", infrastructure=infrastructure)
     error = error[:500]
     with _kb.write_txn(conn):
+        if cause:
+            return park_infrastructure(conn, task_id, cause, outcome=outcome, error=error)
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
@@ -1415,7 +1412,7 @@ def _record_task_failure(
             if release_claim
             else ("review" if row["status"] == "review" else "ready")
         )
-        failures = int(row["consecutive_failures"]) + (0 if infrastructure else 1)
+        failures = int(row["consecutive_failures"]) + 1
 
         # Per-task override wins over caller-supplied and default thresholds.
         task_override = _kb._row_get(row, "max_retries")
@@ -1424,7 +1421,7 @@ def _record_task_failure(
         else:
             effective_limit, limit_source = int(failure_limit), "dispatcher"
 
-        if infrastructure or not (force_trip or failures >= effective_limit):
+        if not (force_trip or failures >= effective_limit):
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
                 conn.execute(
@@ -1442,9 +1439,7 @@ def _record_task_failure(
                 )
             # Timeout/crash path's caller already emitted its own event.
             if end_run:
-                detail = {"failures": failures, "retry_status": retry_status}
-                if infrastructure:
-                    detail["infrastructure"] = True
+                detail = {"failures": failures, "retry_status": retry_status, "failure_class": "task"}
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
@@ -1463,6 +1458,7 @@ def _record_task_failure(
         )
         payload = {
             "failures": failures,
+            "failure_class": "task",
             "effective_limit": effective_limit,
             "limit_source": limit_source,
             "error": error,
@@ -1476,6 +1472,7 @@ def _record_task_failure(
                 conn, task_id, outcome="gave_up", status="gave_up", error=error,
                 metadata={
                     "failures": failures,
+                    "failure_class": "task",
                     "trigger_outcome": outcome,
                     "effective_limit": effective_limit,
                     "limit_source": limit_source,
@@ -2711,7 +2708,8 @@ def _open_worker_log(task: Task, board: Optional[str]):
     log_path = log_dir / f"{task.id}.log"
     from hermes_cli.kanban_worker_log import rotate_worker_log, worker_log_rotation_config
     rotate_worker_log(log_path, *worker_log_rotation_config())
-    return open(log_path, "ab")
+    from hermes_cli.kanban_failure_policy import open_run_log
+    return open_run_log(log_path, task.current_run_id)
 
 
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:

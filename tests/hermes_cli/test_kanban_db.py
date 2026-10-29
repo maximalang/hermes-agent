@@ -321,67 +321,24 @@ def _exited_status(code: int) -> int:
 
 
 
-def test_rate_limit_exit_requeues_without_counting_failure(
-    kanban_home, monkeypatch,
-):
-    """A rate-limit sentinel exit releases the task to ``ready`` and leaves
-    ``consecutive_failures`` untouched — the breaker must never trip on a
-    transient throttle, even across many quota-wall hits."""
-    import hermes_cli.kanban_db as _kb
-    from hermes_cli import kanban_db_dispatch as _kbd
-
-    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+def test_rate_limit_exit_holds_without_counting_failure(kanban_home, monkeypatch):
+    """One quota wall holds work; further ticks do not burn runs or retry budget."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-
     with kbc.connect() as conn:
-        host = _kb._claimer_id().split(":", 1)[0]
+        host = kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="rl", assignee="a")
-
-        # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2).
-        # If any of these counted as a failure the task would be blocked.
-        for i in range(6):
-            pid = 70000 + i
-            # Claim to open a real run (so detect_crashed_workers can close
-            # it with a rate_limited outcome), then point the claim at this
-            # host + a dead pid so the crash path acts on it.
-            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
-            conn.execute(
-                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
-                "WHERE id=?",
-                (pid, 0, tid),
-            )
-            conn.commit()
-            _kbd._record_worker_exit(
-                pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
-            )
-
-            crashed = kbd.detect_crashed_workers(conn)
-            # Rate-limited requeues are NOT crashes.
-            assert tid not in crashed
-            rl = getattr(_kbd.detect_crashed_workers, "_last_rate_limited", [])
-            assert tid in rl
-
-            task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"hit {i}: should requeue ready, got {task.status}"
-            )
-            assert task.consecutive_failures == 0, (
-                f"hit {i}: rate-limit must not count a failure, "
-                f"got {task.consecutive_failures}"
-            )
-
-        # Last failure error stamped so the respawn guard recognizes the
-        # quota wall.
-        assert task.last_failure_error and "rate-limited" in task.last_failure_error
-
-        # A ``rate_limited`` run outcome was recorded (not ``crashed``).
-        outcomes = [
-            r["outcome"] for r in conn.execute(
-                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
-            ).fetchall()
-        ]
-        assert "rate_limited" in outcomes
-        assert "crashed" not in outcomes
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute("UPDATE tasks SET worker_pid=70000 WHERE id=?", (tid,))
+        conn.commit()
+        kbd._record_worker_exit(70000, _exited_status(kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+        for _ in range(6):
+            assert tid not in kbd.detect_crashed_workers(conn)
+            kb.recompute_ready(conn)
+        task = kb.get_task(conn, tid)
+        assert (task.status, task.block_kind, task.consecutive_failures) == ("blocked", "transient", 0)
+        runs = conn.execute("SELECT outcome FROM task_runs WHERE task_id=?", (tid,)).fetchall()
+        assert [r["outcome"] for r in runs] == ["infrastructure_blocked"]
 
 
 @pytest.mark.parametrize("lane", ["ready", "review"])
@@ -410,17 +367,17 @@ def test_terminal_provider_exit_blocks_after_one_attempt_in_either_lane(kanban_h
         _kbd._record_worker_exit(pid, _exited_status(_kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE))
 
         crashed = kbd.detect_crashed_workers(conn)
-        assert tid in crashed
+        assert tid not in crashed
         assert tid in getattr(_kbd.detect_crashed_workers, "_last_auto_blocked", [])
 
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
-        assert task.consecutive_failures == 1  # one spawn, not failure_limit / max_retries of them
-        assert "terminal provider error" in (task.last_failure_error or "")
-        gave_up = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,),
+        assert task.consecutive_failures == 0
+        assert task.block_kind == "capability"
+        blocked = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='infrastructure_blocked'", (tid,),
         ).fetchone()
-        assert json.loads(gave_up["payload"])["terminal_provider"] is True
+        assert json.loads(blocked["payload"])["cause_marker"] == "provider_configuration"
 
         # Sticky: the breaker did not reach its counter limit, yet the card must stay parked
         # until an operator fixes the provider and unblocks it.
@@ -554,44 +511,35 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
 def test_infrastructure_spawn_refusal_never_charges_the_card(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):
-    """The host refusing to place a worker (managed gateway, user bus gone —
-    #114720) is not a card failure: through the REAL spawn boundary and the
-    real dispatcher accounting, ``consecutive_failures`` stays put, the breaker
-    never parks the card as a bare ``blocked``, the run is tagged
-    ``infrastructure`` and the guard spaces the retries. A control spawn
-    failure on the same card still counts."""
-    from tools import process_registry
+    """A host refusal holds after one attempt without task budget consumption.
+    Explicit recovery is required before a control task failure can run."""
+    from tools.process_registry import RestartSafeScopeUnavailable
 
-    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
-    monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
-    monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
 
     def spawn_via_real_boundary(task, workspace, board=None):
-        kbd._restart_safe_worker_argv(task, ["hermes", "chat"])  # raises: real probe verdict, real _degrade()
-        raise AssertionError("unreachable")
+        # Inject the real typed boundary error, not a Linux probe on Windows.
+        raise RestartSafeScopeUnavailable("host cannot place worker")
 
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="bus is down", assignee="a")
-        for _ in range(3):
+        for i in range(3):
             res = kbd.dispatch_once(conn, spawn_fn=spawn_via_real_boundary, failure_limit=2)
-            assert res.auto_blocked == []
+            assert res.auto_blocked == ([tid] if i == 0 else [])
         row = conn.execute(
             "SELECT status, block_kind, consecutive_failures, last_failure_error FROM tasks WHERE id = ?", (tid,),
         ).fetchone()
-        assert (row["status"], row["block_kind"], row["consecutive_failures"]) == ("ready", None, 0)
-        assert "enable-linger" in row["last_failure_error"]
+        assert (row["status"], row["block_kind"], row["consecutive_failures"]) == ("blocked", "capability", 0)
+        assert "host_scope" in row["last_failure_error"]
         runs = conn.execute(
             "SELECT outcome, metadata FROM task_runs WHERE task_id = ? ORDER BY id", (tid,),
         ).fetchall()
-        assert [r["outcome"] for r in runs] == ["spawn_failed"] * 3
+        assert [r["outcome"] for r in runs] == ["infrastructure_blocked"]
         assert all(json.loads(r["metadata"])["infrastructure"] is True for r in runs)
-
-        monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
-        assert kbd.check_respawn_guard(conn, tid) == "infrastructure_cooldown"
 
         # Control: an ordinary spawn failure on the same card still spends budget.
         monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+        assert kb.unblock_task(conn, tid)
 
         def spawn_broken(task, workspace, board=None):
             raise RuntimeError("profile launcher exploded")

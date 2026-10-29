@@ -38,7 +38,7 @@ def _dead_pid() -> int:
     return proc.pid
 
 
-@pytest.mark.parametrize("bound_claim, expected", [("own", "rate_limited"), ("foreign", "crashed")])
+@pytest.mark.parametrize("bound_claim, expected", [("own", "infrastructure_blocked"), ("foreign", "crashed")])
 def test_managed_exit_75_requeues_rate_limited_not_crashed(conn, bound_claim, expected):
     host = kb._claimer_id().split(":", 1)[0]
     tid = kb.create_task(conn, title="managed", assignee="w")
@@ -58,5 +58,5 @@ def test_managed_exit_75_requeues_rate_limited_not_crashed(conn, bound_claim, ex
 
     outcome = conn.execute("SELECT outcome FROM task_runs WHERE id=?", (task.current_run_id,)).fetchone()[0]
     assert outcome == expected
-    assert (tid in kbd.detect_crashed_workers._last_rate_limited) is (expected == "rate_limited")
+    assert (tid in kbd.detect_crashed_workers._last_auto_blocked) is (expected == "infrastructure_blocked")
     assert (tid in crashed) is (expected == "crashed")
