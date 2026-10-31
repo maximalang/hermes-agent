@@ -29,6 +29,7 @@ if str(_WORKTREE) not in sys.path:
     sys.path.insert(0, str(_WORKTREE))
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_boards as kboards
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 
@@ -53,6 +54,12 @@ def fresh_home(tmp_path, monkeypatch):
         "HERMES_KANBAN_WORKSPACES_ROOT",
         "HERMES_KANBAN_HOME",
         "HERMES_KANBAN_BOARD",
+        # Worker/delegate lineage markers fence board mutations for ANY home
+        # they can reach — without scrubbing them, running this suite from a
+        # dispatched worker (HERMES_KANBAN_TASK / delegated-child marker in
+        # the inherited env) fails every seeding call.
+        "HERMES_KANBAN_TASK",
+        "HERMES_DELEGATED_CHILD_CONTEXT",
     ):
         monkeypatch.delenv(var, raising=False)
     # Also reset hermes_constants cache so get_default_hermes_root() re-reads.
@@ -430,3 +437,94 @@ class TestBoardResurrection:
         assert meta["name"] == "My Board"
         assert "keepname" in [b["slug"] for b in kb.list_boards(include_archived=True)]
         assert "keepname" not in [b["slug"] for b in kb.list_boards(include_archived=False)]
+
+
+# ---------------------------------------------------------------------------
+# Per-board COUNTS under the dispatcher HERMES_KANBAN_DB pin
+# ---------------------------------------------------------------------------
+
+class TestBoardsListCountsUnderPin:
+    """``boards list``/``show`` COUNTS must come from each board's own
+    database even when the dispatcher pins ``HERMES_KANBAN_DB`` (fenced
+    worker context: ``HERMES_KANBAN_TASK`` / delegated-child marker).
+
+    Regression (fleet-ops K1 audit, 2026-10-29): under the pin
+    ``kanban_db_path(board=<slug>)`` resolved EVERY slug to the pinned file,
+    so every COUNTS row repeated the pinned board's metrics while the slug
+    column (filesystem-only) stayed correct. Ordinary routing resolution
+    must keep honoring the pin — only the display read bypasses it.
+    """
+
+    TOTALS = {"alpha": 2, "beta": 1, "default": 3}
+
+    def _seed_distinct_boards(self):
+        kb.create_board("alpha")
+        kb.create_board("beta")
+        with kbc.connect_closing(board="alpha") as conn:
+            for i in range(2):
+                kb.create_task(conn, title=f"a{i}", assignee="dev")
+        with kbc.connect_closing(board="beta") as conn:
+            kb.create_task(conn, title="b0", assignee="dev")
+        with kbc.connect_closing(board="default") as conn:
+            for i in range(3):
+                kb.create_task(conn, title=f"d{i}", assignee="dev")
+
+    def _totals(self):
+        return {slug: sum(kboards._board_task_counts(slug).values()) for slug in self.TOTALS}
+
+    def test_counts_use_each_boards_own_db_under_pin(self, fresh_home, monkeypatch):
+        """Fenced worker: counts per board, routing still pinned (5ec6baa)."""
+        self._seed_distinct_boards()
+        alpha_db = kb.board_dir("alpha") / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(alpha_db))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_pin_counts")
+        assert self._totals() == self.TOTALS
+        # Ordinary current-board resolution is unchanged: with no explicit
+        # board the pin still rules, and an explicit board stays fenced to it.
+        assert kb.kanban_db_path() == alpha_db
+        assert kb.kanban_db_path(board="beta") == alpha_db
+
+    def test_counts_use_each_boards_own_db_under_delegated_marker(self, fresh_home, monkeypatch):
+        """Same invariant via the delegated-child marker instead of TASK."""
+        from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+        self._seed_distinct_boards()
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_dir("beta") / "kanban.db"))
+        monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, "1")
+        assert self._totals() == self.TOTALS
+
+    def test_counts_unpinned_unchanged(self, fresh_home):
+        """No pin: the fix must not disturb the ordinary display path."""
+        self._seed_distinct_boards()
+        assert self._totals() == self.TOTALS
+
+    def test_counts_never_create_or_initialize_a_db(self, fresh_home):
+        """The counts read is strictly read-only: a missing DB stays missing."""
+        kb.create_board("ghost")
+        ghost_db = kb.board_dir("ghost") / "kanban.db"
+        ghost_db.unlink()
+        assert kboards._board_task_counts("ghost") == {}
+        assert not ghost_db.exists()
+        # Unknown slug: no board dir is created either.
+        assert kboards._board_task_counts("never-created") == {}
+        assert not kb.board_dir("never-created").exists()
+
+    def test_cli_boards_list_counts_distinct_under_pin(self, fresh_home):
+        """End-to-end worker context: CLI subprocess with the pin + fence
+        marker must still report each board's own totals."""
+        self._seed_distinct_boards()
+        env = {
+            "HERMES_HOME": str(fresh_home),
+            "HERMES_KANBAN_DB": str(kb.board_dir("alpha") / "kanban.db"),
+            "HERMES_KANBAN_TASK": "t_pin_counts_cli",
+        }
+        r = _cli(["boards", "list", "--json"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        rows = {b["slug"]: b["total"] for b in json.loads(r.stdout)}
+        assert rows == self.TOTALS
+
+    def test_cli_boards_list_counts_distinct_unpinned(self, fresh_home):
+        self._seed_distinct_boards()
+        r = _cli(["boards", "list", "--json"], env_extra={"HERMES_HOME": str(fresh_home)})
+        assert r.returncode == 0, r.stderr
+        rows = {b["slug"]: b["total"] for b in json.loads(r.stdout)}
+        assert rows == self.TOTALS

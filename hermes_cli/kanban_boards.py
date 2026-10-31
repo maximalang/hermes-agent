@@ -6,10 +6,11 @@ Filesystem-only, so every action works before ``kanban init`` and must ignore th
 from __future__ import annotations
 
 import argparse
+import sqlite3
+from pathlib import Path
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
-from hermes_cli import kanban_db_connect as kbc
 from hermes_cli.kanban_output import _err, _fmt_counts, _json_out
 
 
@@ -22,14 +23,45 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def _board_counts_db_path(slug: str) -> Path:
+    """The board's own ``kanban.db`` for the boards table's COUNTS column.
+
+    Resolved from the board directory, deliberately bypassing the single-file
+    ``HERMES_KANBAN_DB`` pin: that pin routes a fenced worker's kanban
+    *writes* to its own board (``_explicit_board_intent_pinned``), but
+    ``boards list``/``show`` are filesystem-level views whose counts must come
+    from each board's own database — under the pin ``kanban_db_path(board=…)``
+    resolved every slug to the pinned file, so every COUNTS row repeated that
+    one board's metrics. Root relocation (``HERMES_KANBAN_HOME``) still applies
+    through ``kanban_home()`` / ``board_dir()``; task routing via
+    ``kanban_db_path`` is untouched.
+    """
+    if slug == kb.DEFAULT_BOARD:
+        return kb.kanban_home() / "kanban.db"
+    return kb.board_dir(slug) / "kanban.db"
+
+
 def _board_task_counts(slug: str) -> dict[str, int]:
-    """``{status: count}`` for a board. Safe to call on an empty DB."""
+    """``{status: count}`` for a board. Safe to call on an empty DB.
+
+    Opens strictly read-only (``mode=ro``) and never initializes or migrates:
+    a display read must not mutate a board — and must not be rerouted by the
+    ``HERMES_KANBAN_DB`` pin away from the board's own database (see
+    ``_board_counts_db_path``).
+    """
     try:
-        if not kb.kanban_db_path(board=slug).exists():
+        path = _board_counts_db_path(slug)
+        if not path.exists():
             return {}
-        with kbc.connect_closing(board=slug) as conn:
-            rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
-        return {r["status"]: int(r["n"]) for r in rows}
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {row["status"]: int(row["n"]) for row in rows}
     except Exception:
         return {}
 
