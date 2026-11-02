@@ -25,6 +25,7 @@ from collections import deque
 from datetime import datetime, timezone, UTC
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -150,6 +151,82 @@ def _timestamp_fresh(raw: str, stale_msg: str, *args) -> bool:
         logger.warning(stale_msg, *args)
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# /cron-events/<source> — event-driven cron ingress (fleet spec
+# docs/fleet-ops/cron-patterns-0710/event-receiver.md). Persist-then-200-style
+# receiver: HMAC-verified deliveries are appended to the company profile's
+# events inbox as one JSON file each; a gated cron lane consumes them. The
+# handler never spawns agent runs and never blocks on Hermes.
+# ---------------------------------------------------------------------------
+
+_CRON_EVENTS_SOURCE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+_CRON_EVENTS_SEEN_CAP = 512  # rolling delivery-id watermark for replay dedup
+
+
+def _cron_events_root() -> Path:
+    """Inbox root for cron events. Default: the *company* profile's events/ dir (spec anchor);
+    ``CRON_EVENTS_ROOT`` overrides (tests, relocations)."""
+    override = (os.environ.get("CRON_EVENTS_ROOT") or "").strip()
+    if override:
+        return Path(override)
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home()) / "profiles" / "company" / "events"
+
+
+def _cron_event_secret(source: str) -> Optional[str]:
+    """HMAC secret for a cron-event source, from the process environment only — never from a
+    repo-readable file. Per-source ``CRON_EVENTS_SECRET__<SOURCE>`` beats the shared
+    ``CRON_EVENTS_HMAC_SECRET``. Empty values count as missing (fail closed)."""
+    per_source = f"CRON_EVENTS_SECRET__{source.upper().replace('-', '_')}"
+    for var in (per_source, "CRON_EVENTS_HMAC_SECRET"):
+        value = (os.environ.get(var) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _cron_seen_path(root: Path) -> Path:
+    return root / "state" / "seen-deliveries.json"
+
+
+def _cron_load_seen(path: Path) -> list:
+    """Read the delivery-id watermark ledger; any corruption starts it empty (accept — a re-queued
+    duplicate is recoverable downstream, a rejected valid event is not)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        ids = data.get("ids") if isinstance(data, dict) else None
+        if isinstance(ids, list):
+            return [str(x) for x in ids][-_CRON_EVENTS_SEEN_CAP:]
+    except (OSError, ValueError):
+        pass
+    return []
+
+
+def _cron_save_seen(path: Path, ids: list) -> None:
+    """Persist the watermark ledger atomically (tmp + os.replace). Best-effort: a failed save must
+    not reject the delivery — the file is already in the inbox and the consumer dedups too."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("[cron-events] seen-ledger persist failed (dedup degraded): %s", exc)
+
+
+def _cron_write_inbox(root: Path, source: str, filename: str, envelope: dict) -> str:
+    """Write one envelope JSON to ``inbox/<source>/<filename>`` via tmp+rename (the gate/consumer
+    never see a partial file). Returns the path relative to the inbox root. Raises OSError."""
+    inbox_dir = root / "inbox" / source
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    final = inbox_dir / filename
+    tmp = inbox_dir / (".tmp-" + filename)
+    tmp.write_text(json.dumps(envelope, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    os.replace(tmp, final)
+    return f"{source}/{filename}"
 
 
 def _is_known_platform(name: str) -> bool:
@@ -286,6 +363,10 @@ class WebhookAdapter(BasePlatformAdapter):
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # /p/<profile>/ routes the event to that profile (honored only under gateway.multiplex_profiles).
         app.router.add_post("/p/{profile}/webhooks/{route_name}", self._handle_webhook)
+        # Event-driven cron ingress: HMAC-verified persist-only drops into the company events
+        # inbox (spec: docs/fleet-ops/cron-patterns-0710/event-receiver.md). New path only;
+        # /webhooks/* routes are untouched.
+        app.router.add_post("/cron-events/{source}", self._handle_cron_event)
         # Without an api_server listener this port is the shared listener: forward a secondary's
         # inbound-port platforms (Twilio, LINE, Teams, ...) registered in shared-listener mode.
         app.router.add_route("*", "/p/{profile}/{tail:.*}", self._handle_profile_ingress)
@@ -413,6 +494,77 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: web.Request) -> web.Response:
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
+
+    async def _handle_cron_event(self, request: "web.Request") -> "web.Response":
+        """POST /cron-events/{source} — persist one HMAC-verified delivery to the company events
+        inbox and answer 204. Never spawns agent runs, never blocks on Hermes: the gated cron lane
+        (scripts/event_inbox_gate.py) wakes the consumer once per batch. Replay-safe: a delivery-id
+        watermark ledger acks duplicates without re-queuing (at-least-once; the consumer dedups too)."""
+        source = request.match_info.get("source") or ""
+        if not _CRON_EVENTS_SOURCE_RE.fullmatch(source):
+            return web.Response(status=404)  # same shape as any unknown path — no source enumeration
+        try:
+            raw_body = await request.read()
+        except Exception:
+            return web.Response(status=400)
+        if len(raw_body) > self._max_body_bytes:
+            return web.Response(status=413)
+        secret = _cron_event_secret(source)
+        if not secret:
+            logger.error("[cron-events] %s rejected: no env secret (CRON_EVENTS_SECRET__%s / "
+                         "CRON_EVENTS_HMAC_SECRET)", source, source.upper().replace("-", "_"))
+            return web.Response(status=503)
+        provided = (request.headers.get("X-Hub-Signature-256") or "").strip()
+        expected = "sha256=" + _hex_hmac(secret, raw_body)
+        if not provided or not _hmac_str_equal(provided, expected):
+            logger.warning("[cron-events] %s: bad signature from %s", source, request.remote)
+            return web.Response(status=401)
+
+        delivery_id = (request.headers.get("X-GitHub-Delivery")
+                       or request.headers.get("X-Request-Id") or "").strip()
+        event_type = (request.headers.get("X-GitHub-Event") or "").strip() or "unknown"
+        root = _cron_events_root()
+        seen_path = _cron_seen_path(root)
+        seen = _cron_load_seen(seen_path) if delivery_id else []
+        if delivery_id and delivery_id in seen:
+            logger.info("[cron-events] %s: duplicate delivery %s — acked, not re-queued",
+                        source, delivery_id)
+            return web.Response(status=204)
+
+        try:
+            payload_obj = json.loads(raw_body.decode("utf-8", errors="replace"))
+            if not isinstance(payload_obj, (dict, list)):
+                payload_obj = {"_value": payload_obj}
+        except ValueError:
+            payload_obj = {"_raw_b64": base64.b64encode(raw_body).decode("ascii")}
+        received = datetime.now(timezone.utc)
+        envelope = {
+            "schema": 1,
+            "source": source,
+            "received_at": received.isoformat(),
+            "delivery_id": delivery_id,
+            "event": event_type,
+            "headers": {
+                "user-agent": request.headers.get("User-Agent", ""),
+                "content-type": request.headers.get("Content-Type", ""),
+            },
+            "payload": payload_obj,
+        }
+        filename = f"{received:%Y%m%dT%H%M%S}.{received.microsecond:06d}Z-{uuid.uuid4().hex[:8]}.json"
+        try:
+            rel = _cron_write_inbox(root, source, filename, envelope)
+        except OSError as exc:
+            # 500 so the producer retries — the event must not be acked into the void.
+            logger.error("[cron-events] %s: inbox write failed for delivery %s: %s",
+                         source, delivery_id, exc)
+            return web.Response(status=500)
+        # Watermark is recorded only after the file is durably in the inbox — a write failure
+        # must stay retryable, never deduped away.
+        if delivery_id:
+            _cron_save_seen(seen_path, (seen + [delivery_id])[-_CRON_EVENTS_SEEN_CAP:])
+        logger.info("[cron-events] %s event=%s delivery=%s -> %s",
+                    source, event_type, delivery_id or "-", rel)
+        return web.Response(status=204)
 
     def _dynamic_route_allowed(self, name: str, route: dict) -> bool:
         """Reject dynamic routes whose effective secret is missing, blank, or not a string
