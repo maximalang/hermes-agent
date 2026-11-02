@@ -121,9 +121,15 @@ def test_specify_updates_fields_and_promotes(orchestrator_env):
         "body": "task_type: research\n\n**Goal**\nDo the thing.",
         "assignee": "worker-b",
         "reason": "dispatcher flagged this card as too thin to dispatch",
-        # Unknown author-ish args must be ignored (anti-forgery, #19713).
+    })
+    # Unknown author-ish args are refused by the shared kanban argument
+    # validation (upstream hardened it after #19713): the call fails loudly
+    # and nothing changes — the author can never be forged silently either.
+    out_forge = _handle({
+        "task_id": tid,
         "author": "hermes-system",
     })
+    assert out_forge.get("error"), out_forge
     assert out["ok"] is True, out
     assert out["status"] == "ready"  # no parents → recompute promotes past todo
     assert out["title"] == "Refined: rough idea"
@@ -256,6 +262,9 @@ def test_specify_board_isolation(orchestrator_env):
     """board=<slug> routes the whole call; other boards are untouched."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_boards
+    # Upstream board registry: a non-default board must be created before connect().
+    kanban_db_boards.create_board("alt")
     with _connect() as conn:
         default_tid = _create_triage(conn, title="default-card")
     with kbc.connect(board="alt") as conn:
