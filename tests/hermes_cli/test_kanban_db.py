@@ -202,6 +202,206 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
 
 
+# ---------------------------------------------------------------------------
+# Scheduled parks: persistent wake time + dispatcher waker
+# ---------------------------------------------------------------------------
+
+
+def test_schedule_marker_persists_wake_time(kanban_home):
+    """The documented SCHEDULED_UNTIL marker becomes durable board state."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="quota window", assignee="ops")
+        ok = kb.schedule_task(
+            conn, t, reason="SCHEDULED_UNTIL=2026-11-03T14:20:00+03:00 zai 5h window reset")
+        assert ok is True
+        task = kb.get_task(conn, t)
+        assert task.status == "scheduled"
+        # 2026-11-03T14:20:00+03:00 == 1793704800
+        assert task.scheduled_until == 1793704800
+        ev = [e for e in kb.list_events(conn, t) if e.kind == "scheduled"][-1]
+        assert ev.payload["until"] == 1793704800
+
+
+def test_schedule_explicit_until_and_epoch_marker(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="explicit", assignee="ops")
+        assert kb.schedule_task(conn, t, until="2026-11-03T14:20:00+03:00") is True
+        assert kb.get_task(conn, t).scheduled_until == 1793704800
+
+        t2 = kb.create_task(conn, title="epoch", assignee="ops")
+        assert kb.schedule_task(conn, t2, reason="SCHEDULED_UNTIL=1793704800") is True
+        assert kb.get_task(conn, t2).scheduled_until == 1793704800
+
+        # A bad marker parks without a timer (never raises) — old contract.
+        t3 = kb.create_task(conn, title="bad marker", assignee="ops")
+        assert kb.schedule_task(conn, t3, reason="SCHEDULED_UNTIL=eventually") is True
+        assert kb.get_task(conn, t3).scheduled_until is None
+
+
+def test_wake_due_scheduled_wakes_past_due_card(kanban_home):
+    """The 37h-past-due fleet case: the first tick after the deadline wakes it."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="past due", assignee="ops")
+        past = int(time.time()) - 37 * 3600
+        assert kb.schedule_task(conn, t, until=past) is True
+        now = int(time.time())
+        assert kb.wake_due_scheduled(conn, now=now) == [t]
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.scheduled_until is None
+        woke = [e for e in kb.list_events(conn, t) if e.kind == "woke"]
+        assert len(woke) == 1
+        assert woke[0].payload["status"] == "ready"
+        assert 37 * 3600 - 120 <= woke[0].payload["late_by"] <= 37 * 3600
+        # Woken into ready, the ordinary claim path takes over.
+        assert kb.claim_task(conn, t) is not None
+
+
+def test_wake_not_yet_due_stays_parked(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="future", assignee="ops")
+        assert kb.schedule_task(conn, t, until=int(time.time()) + 3600) is True
+        assert kb.wake_due_scheduled(conn) == []
+        assert kb.get_task(conn, t).status == "scheduled"
+
+
+def test_wake_survives_daemon_restart(kanban_home):
+    """Wake state is board data: a fresh connection (= restarted dispatcher)
+    still wakes a card parked by a previous process."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="restart", assignee="ops")
+        assert kb.schedule_task(conn, t, until=int(time.time()) - 60) is True
+    with kbc.connect() as conn:  # "restart": no in-memory state exists
+        assert kb.wake_due_scheduled(conn) == [t]
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_wake_backfills_legacy_park_from_event_marker(kanban_home):
+    """Parks recorded before the column existed: the marker in the last
+    scheduled event is restored, then the card wakes once due."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="legacy", assignee="ops")
+        past = int(time.time()) - 600
+        assert kb.schedule_task(
+            conn, t, reason=f"SCHEDULED_UNTIL={past} old-style park") is True
+        # Emulate a pre-upgrade board: the column never got the value.
+        conn.execute("UPDATE tasks SET scheduled_until = NULL WHERE id = ?", (t,))
+        assert kb.wake_due_scheduled(conn) == [t]
+        assert kb.get_task(conn, t).status == "ready"
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert "schedule_restored" in kinds and "woke" in kinds
+
+
+def test_wake_markerless_park_needs_manual_unblock(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="external event", assignee="ops")
+        assert kb.schedule_task(conn, t, reason="waiting on external event") is True
+        assert kb.wake_due_scheduled(conn) == []
+        assert kb.get_task(conn, t).status == "scheduled"
+
+
+def test_wake_lands_todo_when_parents_open(kanban_home):
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="ops")
+        child = kb.create_task(conn, title="child", assignee="ops")
+        conn.execute(
+            "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, child))
+        assert kb.schedule_task(conn, child, until=int(time.time()) - 10) is True
+        assert kb.wake_due_scheduled(conn) == [child]
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_unblock_clears_scheduled_until(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="manual revive", assignee="ops")
+        assert kb.schedule_task(conn, t, until=int(time.time()) + 3600) is True
+        assert kb.unblock_task(conn, t) is True
+        task = kb.get_task(conn, t)
+        assert task.status == "ready" and task.scheduled_until is None
+
+
+def test_restore_dropped_schedule_reparks_future_park(kanban_home):
+    """An out-of-band scheduled->ready write (no wake/unblock event) must not
+    silently degrade the park: the card is re-parked until its wake time."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="dropped", assignee="ops")
+        assert kb.schedule_task(conn, t, until=int(time.time()) + 3600) is True
+        # Out-of-band write straight to ready — the observed fleet failure.
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'scheduled'", (t,))
+        assert kb.restore_dropped_schedules(conn) == [t]
+        task = kb.get_task(conn, t)
+        assert task.status == "scheduled"  # protection restored
+        loss = [e for e in kb.list_events(conn, t) if e.kind == "schedule_loss"]
+        assert len(loss) == 1 and loss[0].payload["action"] == "reparked"
+        assert kb.claim_task(conn, t) is None  # still not dispatchable
+
+
+def test_restore_dropped_schedule_past_due_left_ready(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="dropped past", assignee="ops")
+        assert kb.schedule_task(conn, t, until=int(time.time()) - 60) is True
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'scheduled'", (t,))
+        assert kb.restore_dropped_schedules(conn) == [t]
+        task = kb.get_task(conn, t)
+        # The deferred run is due NOW; re-parking would re-strand the card.
+        assert task.status == "ready" and task.scheduled_until is None
+        loss = [e for e in kb.list_events(conn, t) if e.kind == "schedule_loss"]
+        assert loss[-1].payload["action"] == "left_ready"
+
+
+def test_restore_skips_normally_unblocked_and_never_scheduled(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="clean unblock", assignee="ops")
+        assert kb.schedule_task(conn, t, until=int(time.time()) + 3600) is True
+        assert kb.unblock_task(conn, t) is True
+        plain = kb.create_task(conn, title="plain ready", assignee="ops")
+        assert kb.restore_dropped_schedules(conn) == []
+        assert kb.get_task(conn, plain).status == "ready"
+
+
+def test_restore_skips_card_already_claimed_after_loss(kanban_home):
+    """Once a run was claimed after the drop, the park era is history: the
+    guard must not re-park a card that already dispatched."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="already ran", assignee="ops")
+        assert kb.schedule_task(conn, t, until=int(time.time()) + 3600) is True
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'scheduled'", (t,))
+        kb._append_event(conn, t, "claimed", {"run_id": 1}, run_id=1)
+        assert kb.restore_dropped_schedules(conn) == []
+
+
+def test_dispatch_tick_wakes_and_spawns_due_card(kanban_home, all_assignees_spawnable):
+    """End to end through the real dispatcher tick: the reclaim phase wakes a
+    due park, and the very same tick spawns it."""
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 4242
+
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="e2e wake", assignee="ops")
+        assert kb.schedule_task(conn, t, until=int(time.time()) - 5) is True
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert res.woken == [t]
+        assert spawns == [t]
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_dispatch_tick_flags_dropped_schedule(kanban_home, all_assignees_spawnable):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="loss via tick", assignee="ops")
+        assert kb.schedule_task(conn, t, until=int(time.time()) + 3600) is True
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'scheduled'", (t,))
+        res = kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: 1)
+        assert res.schedule_losses == [t]
+        assert kb.get_task(conn, t).status == "scheduled"  # re-parked, not spawned
+
+
 
 
 

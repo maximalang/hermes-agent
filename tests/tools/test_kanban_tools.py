@@ -393,8 +393,13 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
         assert kb.get_task(conn, worker_env).status == "scheduled"
         run = kb.latest_run(conn, worker_env)
         assert (run.outcome, run.summary) == ("scheduled", reason)
+        # The marker in the reason becomes durable wake state (epoch of
+        # 2026-09-13T00:00:00Z) recorded on both the card and the event.
+        assert kb.get_task(conn, worker_env).scheduled_until == 1789257600
         assert any(
-            event.kind == "scheduled" and event.payload == {"reason": reason}
+            event.kind == "scheduled" and event.payload == {
+                "reason": reason, "until": 1789257600,
+            }
             for event in kb.list_events(conn, worker_env)
         )
 

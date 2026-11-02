@@ -24,7 +24,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union
 
 from toolsets import get_toolset_names
 
@@ -738,12 +738,17 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Epoch seconds a 'scheduled' park wakes at (persistent wake state; None =
+    # external-event park, manual unblock only). See wake_due_scheduled.
+    scheduled_until: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         g = lambda col, default=None: _lossy_text(_row_get(row, col, default))  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        # Epoch text from outside writers normalises to int-or-None here.
+        until_raw = str(g("scheduled_until") or "").strip()
         return cls(
             **{col: _lossy_text(row[col]) for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -755,6 +760,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            scheduled_until=int(until_raw) if until_raw.isdigit() else None,
         )
 
 
@@ -972,7 +978,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Persistent wake time for 'scheduled' cards (epoch seconds): set by
+    -- schedule_task from an explicit ``until`` or a ``SCHEDULED_UNTIL``
+    -- marker parsed out of the reason. wake_due_scheduled() returns due rows
+    -- to their resumable phase, so the wake survives daemon restarts. NULL =
+    -- parked on an external event (manual unblock remains the only exit).
+    scheduled_until     INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3733,6 +3745,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # is a fresh start for the retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "scheduled_until = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
@@ -4024,17 +4037,64 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+_SCHEDULED_UNTIL_RE = re.compile(r"SCHEDULED_UNTIL\s*=\s*([^\s,;]+)", re.IGNORECASE)
+
+
+def parse_scheduled_until(text: Optional[str]) -> Optional[int]:
+    """Epoch seconds named by a ``SCHEDULED_UNTIL=<ISO8601|epoch>`` marker in *text*.
+
+    The marker is the documented wake-up contract of ``kanban_schedule`` (see
+    ``KANBAN_SCHEDULE_SCHEMA``), so it doubles as the recovery source for parks
+    recorded before ``tasks.scheduled_until`` existed. Returns ``None`` for a
+    missing or unparseable marker — never raises: a bad marker parks without a
+    timer exactly as it always did.
+    """
+    if not text:
+        return None
+    m = _SCHEDULED_UNTIL_RE.search(text)
+    if not m:
+        return None
+    token = m.group(1).strip().rstrip(").,;")
+    if token.isdigit() and len(token) >= 9:
+        return int(token)
+    try:
+        from datetime import datetime
+        return int(datetime.fromisoformat(token).timestamp())
+    except ValueError:
+        return None
+
+
+def _resolve_schedule_until(until: Optional[Union[int, str]], reason: Optional[str]) -> Optional[int]:
+    """Explicit ``until`` (epoch seconds or ISO8601 text) beats the reason marker."""
+    if until is None or isinstance(until, bool):
+        return parse_scheduled_until(reason)
+    if isinstance(until, int):
+        return int(until)
+    if isinstance(until, float):
+        return int(until)
+    return parse_scheduled_until(f"SCHEDULED_UNTIL={until}")
+
+
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, until: Optional[Union[int, str]] = None,
 ) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    """Park in ``scheduled`` (not dispatchable) until its recorded wake time.
+
+    ``until`` (epoch seconds or ISO8601) — or a ``SCHEDULED_UNTIL=<ISO8601>``
+    marker parsed from ``reason`` — persists in ``tasks.scheduled_until``, and
+    :func:`wake_due_scheduled` returns the card to its resumable phase once the
+    time passes (across daemon restarts: the wake state is board data, not
+    process memory). Without a time the park waits on an external event and
+    only ``unblock_task`` can re-gate it (the original contract).
+    """
+    until_epoch = _resolve_schedule_until(until, reason)
     with write_txn(conn):
-        params: list[Any] = [task_id]
+        params: list[Any] = [until_epoch, task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
+                   scheduled_until = ?,
                    claim_lock   = NULL,
                    claim_expires= NULL,
                    worker_pid   = NULL
@@ -4049,8 +4109,170 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload: dict = {"reason": reason}
+        if until_epoch is not None:
+            payload["until"] = until_epoch
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
+
+
+def _last_scheduled_event_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """``reason`` of the newest ``scheduled`` event, or None (missing/unreadable)."""
+    ev = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'scheduled' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if ev is None:
+        return None
+    try:
+        payload = json.loads(ev["payload"])
+    except (ValueError, TypeError):
+        return None
+    return payload.get("reason") if isinstance(payload, dict) else None
+
+
+def wake_due_scheduled(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
+    """Persistent waker: return due ``scheduled`` cards to their resumable phase.
+
+    The wake state lives in ``tasks.scheduled_until`` (for parks recorded
+    before that column existed, the ``SCHEDULED_UNTIL`` marker of the last
+    ``scheduled`` event is backfilled first with a ``schedule_restored``
+    event), so a daemon restart can no longer strand a parked card: the first
+    tick after the deadline wakes it. A park with no recorded time waits on an
+    external event and is skipped — manual unblock stays its only exit.
+
+    Waking re-gates on parents exactly like ``unblock_task`` (landing
+    ``ready``/``todo``), resets the failure budget, closes a leaked run, and
+    appends a ``woke`` event carrying ``until``/``late_by`` so a late wake is
+    visible on the board. Returns the woken task ids.
+    """
+    now = int(now if now is not None else time.time())
+    woken: list[str] = []
+    rows = conn.execute(
+        "SELECT id, scheduled_until FROM tasks WHERE status = 'scheduled'"
+    ).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        raw_until = row["scheduled_until"]
+        until = int(raw_until) if raw_until is not None and str(raw_until).strip().isdigit() else None
+        if until is None:
+            # Pre-persistence park: recover the recorded marker, if any.
+            until = parse_scheduled_until(_last_scheduled_event_reason(conn, task_id))
+            if until is None:
+                continue  # external-event park: manual unblock only
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET scheduled_until = ? "
+                    "WHERE id = ? AND status = 'scheduled'", (until, task_id),
+                )
+                if cur.rowcount == 1:
+                    _append_event(conn, task_id, "schedule_restored", {"until": until})
+        if until > now:
+            continue
+        with write_txn(conn):
+            if _task_status(conn, task_id) != "scheduled":
+                continue  # re-read inside the txn: someone else already moved it
+            _reclaim_dangling_run(
+                conn, task_id, statuses=("scheduled",), now=now,
+                note="invariant recovery on wake",
+            )
+            landing = _landing_status_after_parents(conn, task_id)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, scheduled_until = NULL, "
+                "consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ? AND status = 'scheduled'", (landing, task_id),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn, task_id, "woke",
+                {"status": landing, "until": until, "late_by": max(0, now - until)},
+            )
+        woken.append(task_id)
+        _log.info(
+            "kanban wake: scheduled task %s woke (until=%d, late_by=%ds)",
+            task_id, until, max(0, now - until),
+        )
+    return woken
+
+
+# Events that legitimately end a ``scheduled`` park era: the two native exits
+# (manual unblock, the waker) plus every kind that presupposes the card moved
+# on (a run was claimed, completed, promoted or reconciled after the park).
+_WAKE_CLOSING_EVENT_KINDS = (
+    "unblocked", "woke", "claimed", "completed", "promoted", "reconciled", "schedule_loss",
+)
+
+
+def restore_dropped_schedules(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
+    """Surface/re-park ``ready`` cards whose ``scheduled`` park vanished without a wake.
+
+    Only ``unblock_task``/:func:`wake_due_scheduled` may end a park, and each
+    appends a closing event. A ``ready`` card whose newest ``scheduled`` event
+    has no closer after it was moved out-of-band (direct SQL / external
+    tooling) — the observed fleet failure where a quota-window park silently
+    degraded into an ordinary ready card and dispatched into the very wall it
+    was parked against. With a wake time still in the future the card is
+    re-parked (keeping that time) and a ``schedule_loss`` event makes the
+    out-of-band write loud; with the time already past (or none recorded) the
+    card stays ready — its deferred run is due NOW, holding it would
+    re-strand it — and the loss is still recorded. Returns affected task ids.
+    """
+    now = int(now if now is not None else time.time())
+    affected: list[str] = []
+    rows = conn.execute(
+        "SELECT id, scheduled_until FROM tasks WHERE status = 'ready' AND claim_lock IS NULL"
+    ).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        last = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'scheduled' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        if last is None:
+            continue
+        kinds_ph = ",".join("?" * len(_WAKE_CLOSING_EVENT_KINDS))
+        closed = conn.execute(
+            f"SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+            f"AND kind IN ({kinds_ph}) LIMIT 1",
+            (task_id, last["id"], *_WAKE_CLOSING_EVENT_KINDS),
+        ).fetchone()
+        if closed is not None:
+            continue
+        # Unclosed park on a ready card: recover the intended wake time.
+        raw_until = row["scheduled_until"]
+        until = int(raw_until) if raw_until is not None and str(raw_until).strip().isdigit() else None
+        if until is None:
+            until = parse_scheduled_until(_last_scheduled_event_reason(conn, task_id))
+        with write_txn(conn):
+            if _task_status(conn, task_id) != "ready":
+                continue  # raced: another writer moved it, re-check next tick
+            if until is not None and until > now:
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'scheduled', scheduled_until = ? "
+                    "WHERE id = ? AND status = 'ready'", (until, task_id),
+                )
+                if cur.rowcount != 1:
+                    continue
+                _append_event(
+                    conn, task_id, "schedule_loss",
+                    {"detected": "ready", "until": until, "action": "reparked"},
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET scheduled_until = NULL "
+                    "WHERE id = ? AND status = 'ready'", (task_id,),
+                )
+                _append_event(
+                    conn, task_id, "schedule_loss",
+                    {"detected": "ready", "until": until, "action": "left_ready"},
+                )
+        affected.append(task_id)
+        _log.warning(
+            "kanban wake: dropped schedule on %s detected (until=%s)",
+            task_id, until,
+        )
+    return affected
 
 
 # --- Worker context builder (what a spawned worker sees) ---

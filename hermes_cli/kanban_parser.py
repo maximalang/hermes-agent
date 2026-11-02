@@ -329,6 +329,12 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
         _bulk_ids("schedule"),
+        _arg("--until",
+             help="Wake-up time: ISO8601 (e.g. 2026-11-03T14:20:00+03:00) or epoch "
+                  "seconds. Persisted on the card; the dispatcher's waker returns "
+                  "it to ready/todo when it passes. A SCHEDULED_UNTIL marker in the "
+                  "reason is honoured when --until is omitted; without either the "
+                  "card waits for an explicit unblock."),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),

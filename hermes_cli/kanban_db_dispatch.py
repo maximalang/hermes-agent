@@ -105,6 +105,15 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    woken: list[str] = field(default_factory=list)
+    """``scheduled`` cards whose persistent wake time passed and were returned
+    to their resumable phase by ``wake_due_scheduled`` this tick (board data,
+    not process memory — the wake survives daemon restarts)."""
+    schedule_losses: list[str] = field(default_factory=list)
+    """``ready`` cards whose ``scheduled`` park vanished without a wake/unblock
+    event (out-of-band write) — re-parked or surfaced by
+    ``restore_dropped_schedules`` so a dropped schedule never silently
+    degrades into an ordinary ready card."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -2224,6 +2233,12 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    # Persistent scheduled-wake phase: due parks re-enter the dispatch lanes on
+    # this same tick (a daemon restart can no longer strand them — the wake
+    # time is board data), and a park that vanished out-of-band is re-parked
+    # and surfaced instead of silently degrading to an ordinary ready card.
+    result.woken = _kb.wake_due_scheduled(conn)
+    result.schedule_losses = _kb.restore_dropped_schedules(conn)
 
 
 def _tick_spawn_budget(
