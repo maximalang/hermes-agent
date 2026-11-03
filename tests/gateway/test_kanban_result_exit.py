@@ -75,3 +75,33 @@ def test_managed_start_failure_books_the_one_shot_credential_exit(tmp_path, monk
 
     session_kanban.record_start_failure(frame, error)
     assert session_kanban.worker_exit_code(path, context) == expected
+
+
+def test_skills_unavailable_settles_as_visible_failed_result(tmp_path, monkeypatch):
+    """A card-pinned skill the assignee profile cannot load is an operator-fixable card defect,
+    never a lost execution: the turn settles through the normal result path (terminal admission,
+    exit 1) with the missing skill names in worker_result.last_output — not as the 'unknown'
+    admission the dispatcher submitter reports as 'Kanban execution unknown; retained by owner'
+    and requeues into the same wall (fleet-ops t_8e61bb69, 2026-10-23..11-02)."""
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    from agent import skill_commands
+    monkeypatch.setattr(skill_commands, "build_preloaded_skills_prompt",
+                        lambda _skills, task_id=None: ("", [], ["gpt-pool-quota-repair"]))
+    frame = {"policy": {"kanban_json": json.dumps({**context, "skills": ["gpt-pool-quota-repair"]})}}
+
+    result = session_kanban.run_worker_turns(SimpleNamespace(session_id="local-skills"), frame, [])
+
+    assert result["failed"] is True
+    assert "kanban_skills_unavailable" in result["final_response"]
+    assert "gpt-pool-quota-repair" in result["final_response"]
+    assert session_kanban.worker_exit_code(path, context) == 1
+    with connect_closing(path) as conn:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='worker_result'"
+            " ORDER BY id DESC LIMIT 1", (context["task_id"],)).fetchone()
+    booked = json.loads(row[0])
+    assert booked["exit_code"] == 1
+    assert "kanban_skills_unavailable: gpt-pool-quota-repair" in booked["last_output"]
+    # The owner accepts this shape as a terminal worker result frame (settlement, not 'unknown').
+    from agent.managed_worker import accept_result
+    accept_result(dict(result))

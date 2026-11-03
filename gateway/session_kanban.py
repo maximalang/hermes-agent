@@ -385,7 +385,17 @@ def _run_task_turns(agent, frame, history, context):
     from agent.skill_commands import build_preloaded_skills_prompt
     skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
     if missing and not loaded:
-        raise ValueError('kanban_skills_unavailable')
+        # An operator-fixable card defect — a pinned skill this assignee profile cannot load;
+        # no retry can heal it. Settle as an honest failed result (the missing names ride
+        # final_response into worker_result.last_output) instead of raising: a pre-turn
+        # ValueError is booked by the owner as a LOST execution (admission 'unknown'), which
+        # the dispatcher's submitter reports as 'Kanban execution unknown; retained by owner'
+        # and requeues into the same wall with no visible cause (fleet-ops t_8e61bb69,
+        # 2026-10-23..11-02: every dispatch died pre-model in 12-18s loops).
+        return {'failed': True, 'turn_exit_reason': 'kanban_skills_unavailable',
+                'final_response': 'kanban_skills_unavailable: ' + ', '.join(missing)
+                                  + ' — none of the task-pinned skills load for this profile; '
+                                    'fix the card skill pin or install the skill, then requeue'}
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
 
