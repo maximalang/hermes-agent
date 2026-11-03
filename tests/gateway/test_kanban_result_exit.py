@@ -87,7 +87,7 @@ def test_skills_unavailable_settles_as_visible_failed_result(tmp_path, monkeypat
     from agent import skill_commands
     monkeypatch.setattr(skill_commands, "build_preloaded_skills_prompt",
                         lambda _skills, task_id=None: ("", [], ["gpt-pool-quota-repair"]))
-    frame = {"policy": {"kanban_json": json.dumps(context)}}
+    frame = {"policy": {"kanban_json": json.dumps({**context, "skills": ["gpt-pool-quota-repair"]})}}
 
     result = session_kanban.run_worker_turns(SimpleNamespace(session_id="local-skills"), frame, [])
 
