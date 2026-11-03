@@ -179,6 +179,11 @@ class GatewayTurnPrepareMixin:
 
         cfg = getattr(self, "config", None)  # getattr: bare object.__new__ test runners
         if cfg and source is not None:
+            # Under multiplex the ROUTED profile's typed config owns this channel's
+            # model/provider rules; the launch profile's config would silently ignore them
+            # (helper falls back to it for standalone/primary/unserved sources).
+            # TGR-02 rebase: this block moved here from run_turn.py upstream.
+            cfg = self._channel_override_config_for_source(source) or cfg
             ch = _get_channel_override(
                 cfg, source.platform, str(source.chat_id) if source.chat_id else "",
                 thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
