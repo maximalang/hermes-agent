@@ -47,6 +47,7 @@ def test_anchor_guards_blocked_promotion_and_ready_dispatch(conn, all_assignees_
 
 @pytest.mark.parametrize('author,body,when,allowed', [
     ('company', 'COMPANY RELEASE: conditions met', 101, True),
+    ('company', 'COMPANY RELEASE: maintenance hold resolved', 101, True),
     ('default', 'COMPANY RELEASE: conditions met', 101, False),
     ('company', 'note\nCOMPANY RELEASE: conditions met', 101, False),
     ('company', 'COMPANY RELEASE: conditions met', 100, False),

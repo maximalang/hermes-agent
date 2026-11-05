@@ -23,10 +23,10 @@ def active_park_anchor(conn: sqlite3.Connection, task_id: str):
     for row in rows:
         body = kb._lossy_text(row['body']) or ''
         when = kb._to_epoch(row['created_at'])
-        if any(word in body.lower() for word in ('park', 'hold', 'frozen')):
-            anchors.append((row['id'], when))
         if row['author'] == 'company' and body.startswith('COMPANY RELEASE'):
             releases.append(when)
+        elif any(word in body.lower() for word in ('park', 'hold', 'frozen')):
+            anchors.append((row['id'], when))
     if not anchors:
         return None
     # An unreadable time cannot prove a release is later: keep the card parked.
