@@ -1582,6 +1582,10 @@ def check_respawn_guard(
     if row is None:
         return None
 
+    from hermes_cli.kanban_park_anchor import active_park_anchor
+    if active_park_anchor(conn, task_id) is not None:
+        return "park_anchor"
+
     now = int(time.time())
 
     # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
@@ -2124,7 +2128,7 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, guard_park=True)
     if claimed is None:
         return False
     try:
