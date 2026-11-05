@@ -43,7 +43,7 @@ def _publish(path: Path, value: dict) -> None:
 
 def _load_seen(path: Path) -> list[str]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
         ids = value.get("ids") if isinstance(value, dict) else None
         if isinstance(ids, list):
             return [item for item in ids if isinstance(item, str)][-_SEEN_CAP:]

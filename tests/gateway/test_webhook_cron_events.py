@@ -156,3 +156,17 @@ def test_override_keys_captured_in_own_scope(tmp_path):
     # A later request's ambient scope cannot change the receiver's authority.
     keys.clear()
     assert receiver.keys["github"] == KEY
+
+
+def test_bom_ledger_preserves_dedupe(tmp_path):
+    path = tmp_path / "seen.json"
+    path.write_text('\ufeff{"ids": ["known"]}', encoding="utf-8")
+    assert inbox._load_seen(path) == ["known"]
+
+
+def test_failed_atomic_publication_leaves_no_consumer_file(tmp_path):
+    path = tmp_path / "inbox" / "event.json"
+    with patch.object(inbox.os, "replace", side_effect=OSError("injected rename error")):
+        with pytest.raises(OSError):
+            inbox._publish(path, {"schema": 1})
+    assert not list(path.parent.iterdir())
