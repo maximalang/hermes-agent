@@ -238,6 +238,9 @@ class WebhookAdapter(BasePlatformAdapter):
         self._rate_counts: dict[str, deque[float]] = {}  # per-route hit timestamps in a fixed window
         self._rate_limit: int = int(extra.get("rate_limit", 30))  # per minute
         self._max_body_bytes: int = int(extra.get("max_body_bytes", 1_048_576))  # 1MB
+        # Capture the inbox and scoped keys once; request callbacks run off-turn.
+        from gateway.platforms.webhook_cron_events import CronEventReceiver
+        self._cron_events = CronEventReceiver.from_config(extra, self._max_body_bytes)
         self._script_timeout_seconds: int = int(extra.get("script_timeout_seconds", DEFAULT_SCRIPT_TIMEOUT_SECONDS))
         self._route_processor = WebhookRouteProcessor(script_timeout_seconds=self._script_timeout_seconds)
         # Opt-in per-route debounce of rapid same-entity events (route ``coalesce`` block). #92066
@@ -283,6 +286,8 @@ class WebhookAdapter(BasePlatformAdapter):
         # Content-Length that bypass the header check.
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
+        if self._cron_events is not None:
+            app.router.add_post("/cron-events/{source}", self._cron_events.handle)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # /p/<profile>/ routes the event to that profile (honored only under gateway.multiplex_profiles).
         app.router.add_post("/p/{profile}/webhooks/{route_name}", self._handle_webhook)

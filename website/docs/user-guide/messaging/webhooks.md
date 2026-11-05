@@ -70,6 +70,45 @@ Expected response:
 
 ---
 
+## Disk inbox for scheduled consumers
+
+For a consumer that runs independently of webhook agent execution, enable the
+persist-only endpoint on the existing listener. It is **disabled by default**:
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      cron_events_root: /absolute/path/to/events
+      cron_events_sources: [github]
+```
+
+Supply `CRON_EVENTS_HMAC_SECRET` in the adapter-owning profile's environment.
+An optional `CRON_EVENTS_SECRET__GITHUB` overrides it for that source (uppercase,
+hyphens replaced by underscores). Keys are captured at adapter construction;
+restart after changing them. This endpoint never permits `INSECURE_NO_AUTH`.
+
+Send `POST /cron-events/github` with the GitHub `X-Hub-Signature-256` header
+(`sha256=` plus HMAC-SHA256 of the exact request bytes). Other allowlisted source
+names use the same signature protocol. Unknown sources return 404, a missing
+configured key returns 503, a missing/invalid signature returns 401, and oversized
+bodies return 413 (including chunked transfers). Existing `/webhooks/*` routes
+and profile routing are unaffected; the inbox endpoint is owned by the hosting
+adapter and has no `/p/<profile>/` alias.
+
+A 204 response means a complete JSON envelope has been atomically published in
+`<root>/inbox/<source>/`, or the source-scoped delivery ID is a known duplicate.
+The envelope contains `schema: 1`, `source`, UTC `received_at`, `delivery_id`,
+`event`, selected non-authentication `headers`, and `payload`. Non-JSON bytes are
+preserved as `payload._raw_b64`. Inbox write failure returns 500 for producer
+retry. The most recent 512 delivery IDs per source persist in `<root>/state/`;
+ledger failure can create duplicates but cannot acknowledge a lost inbox write.
+Consumers must implement idempotency and manage inbox/processed retention: this
+is at-least-once transport, not an exactly-once queue or an execution receipt.
+Configure independent delivery-status and backlog-age monitoring; HTTP acceptance
+does not prove that a scheduled consumer has run. Do not put secrets in YAML.
+
 ## Configuring Routes {#configuring-routes}
 
 Routes define how different webhook sources are handled. Each route is a named entry under `platforms.webhook.extra.routes` in your `config.yaml`. Adapter settings (`port`, `host`, `secret`, `routes`) may also be written directly under `platforms.webhook:` — both spellings reach the adapter; a value nested under `extra:` wins if the same key appears in both places.
