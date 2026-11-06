@@ -961,7 +961,7 @@ hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to
 hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
         [--priority N]
 hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
-hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
+hermes kanban schedule <id> --until <ISO8601>           # park in Scheduled with a persistent wake time
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
@@ -1024,14 +1024,32 @@ kanban:
   default_workdir: ~/work/active-project
 ```
 
-### Scheduled task starts (`scheduled_at`)
+### Scheduled parks wake on their own (`scheduled_until`)
 
-Set `scheduled_at` on a task to delay dispatch until a specific time. The dispatcher skips ready tasks whose `scheduled_at` is in the future and picks them up on the first tick after that timestamp.
+Park a card in `scheduled` with a wake time and the dispatcher's persistent
+waker returns it to its resumable phase (ready, or todo while parents remain
+open) on the first tick after that time — the wake state is board data
+(`tasks.scheduled_until`), so it survives daemon restarts and gateway crashes.
 
 ```bash
-hermes kanban create "nightly backup audit" \
-  --assignee ops --scheduled-at "2026-06-01T03:00:00Z"
+hermes kanban schedule t_ab12cd34 --until "2026-11-03T14:20:00+03:00"
 ```
+
+Workers park themselves the same way with the `kanban_schedule` tool: pass
+`until` or a `SCHEDULED_UNTIL=<ISO8601>` wake-up marker in `reason` (the
+marker alone is honoured when `until` is omitted). An explicit `--until`/`until`
+that fails to parse is **rejected** — the card is not parked at all — so a
+wake time can never silently vanish; only a *marker* that fails to parse parks
+without a timer (external-event park, manual `unblock` only). The wake appends
+a `woke` event carrying `until`/`late_by`; a card parked before the column
+existed is recovered from its recorded marker with a `schedule_restored`
+event. A park **without** a wake time waits on an external event and only an
+explicit `unblock` can revive it — and a park that vanishes without a
+wake/unblock event (an out-of-band status write) is re-parked and surfaced
+with a `schedule_loss` event instead of silently degrading into an ordinary
+ready card. A drop that *repeats* after a re-park stays recoverable: the park
+era only closes on a real wake/unblock/dispatch, or on a past-due loss that
+was deliberately left ready (surfaced once — never re-detected in a loop).
 
 ### Respawn guard
 

@@ -1053,9 +1053,17 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    until = getattr(args, "until", None)
+    if until is not None:
+        # Reject an unreadable explicit wake time up front: scheduling would
+        # otherwise park the card with no timer at all.
+        try:
+            kb.parse_schedule_until_value(until)
+        except ValueError as exc:
+            return _err(str(exc))
     with kbc.connect_closing() as conn:
         op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid), until=until))
         return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
 
 

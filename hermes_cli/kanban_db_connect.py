@@ -871,6 +871,10 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Persistent wake time for 'scheduled' cards (epoch seconds); NULL =
+    # external-event park. Written by schedule_task, consumed by
+    # wake_due_scheduled (see tasks.scheduled_until in kanban_db SCHEMA_SQL).
+    ("scheduled_until", "scheduled_until INTEGER"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
