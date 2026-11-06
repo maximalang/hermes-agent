@@ -279,6 +279,32 @@ def test_unbound_worker_cannot_mutate_card(monkeypatch, worker_env):
         assert kb.get_task(conn, worker_env).status == "done"
 
 
+def test_schedule_invalid_until_is_tool_error_not_timerless_park(worker_env):
+    """An explicit but unreadable ``until`` is rejected as a tool error: the
+    card keeps running — it must never land in a timerless scheduled park."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_schedule({"reason": "quota window", "until": "not-a-time"}))
+    assert "error" in out, out
+    assert "until" in out["error"].lower(), out
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "running"  # never parked
+        assert task.scheduled_until is None
+
+    # The same worker still schedules cleanly with a valid explicit value.
+    out = json.loads(kt._handle_schedule({
+        "reason": "quota window", "until": "2030-01-01T00:00:00+03:00"}))
+    assert out.get("ok") is True, out
+    from datetime import datetime
+    expected_epoch = int(datetime.fromisoformat("2030-01-01T00:00:00+03:00").timestamp())
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "scheduled"
+        assert kb.get_task(conn, worker_env).scheduled_until == expected_epoch
+
+
 def test_malformed_run_id_refused_but_nonlifecycle_allowed(monkeypatch, worker_env):
     """A malformed (non-integer) HERMES_KANBAN_RUN_ID is treated as unbound and
     refuses run-lifecycle mutations, while non-lifecycle tools (heartbeat /

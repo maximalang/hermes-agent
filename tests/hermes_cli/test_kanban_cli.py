@@ -229,6 +229,27 @@ def test_run_slash_reclaim_running_task(kanban_home):
     assert "ready" in out2.lower()
 
 
+def test_run_slash_schedule_invalid_until_refused(kanban_home):
+    """`schedule --until <unreadable>` is a CLI error, not a timerless park:
+    the card is left exactly where it was."""
+    import re
+    from hermes_cli import kanban_db_connect as kbc
+
+    out1 = kc.run_slash("create 'bad until target' --assignee ops")
+    m = re.search(r"(t_[a-f0-9]+)", out1)
+    assert m
+    tid = m.group(1)
+
+    out = kc.run_slash(f"schedule {tid} 'typo' --until not-a-time")
+    assert "until" in out.lower(), out
+    assert "usage" not in out.lower(), out  # a validation error, not argparse usage
+    with kbc.connect() as conn:
+        row = conn.execute(
+            "SELECT status, scheduled_until FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert row["status"] != "scheduled"
+        assert row["scheduled_until"] is None
+
+
 
 
 # ---------------------------------------------------------------------------

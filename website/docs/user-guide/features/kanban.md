@@ -1037,14 +1037,19 @@ hermes kanban schedule t_ab12cd34 --until "2026-11-03T14:20:00+03:00"
 
 Workers park themselves the same way with the `kanban_schedule` tool: pass
 `until` or a `SCHEDULED_UNTIL=<ISO8601>` wake-up marker in `reason` (the
-marker alone is honoured when `until` is omitted). The wake appends a `woke`
-event carrying `until`/`late_by`; a card parked before the column existed is
-recovered from its recorded marker with a `schedule_restored` event. A park
-**without** a wake time waits on an external event and only an explicit
-`unblock` can revive it — and a park that vanishes without a wake/unblock
-event (an out-of-band status write) is re-parked and surfaced with a
-`schedule_loss` event instead of silently degrading into an ordinary ready
-card.
+marker alone is honoured when `until` is omitted). An explicit `--until`/`until`
+that fails to parse is **rejected** — the card is not parked at all — so a
+wake time can never silently vanish; only a *marker* that fails to parse parks
+without a timer (external-event park, manual `unblock` only). The wake appends
+a `woke` event carrying `until`/`late_by`; a card parked before the column
+existed is recovered from its recorded marker with a `schedule_restored`
+event. A park **without** a wake time waits on an external event and only an
+explicit `unblock` can revive it — and a park that vanishes without a
+wake/unblock event (an out-of-band status write) is re-parked and surfaced
+with a `schedule_loss` event instead of silently degrading into an ordinary
+ready card. A drop that *repeats* after a re-park stays recoverable: the park
+era only closes on a real wake/unblock/dispatch, or on a past-due loss that
+was deliberately left ready (surfaced once — never re-detected in a loop).
 
 ### Respawn guard
 

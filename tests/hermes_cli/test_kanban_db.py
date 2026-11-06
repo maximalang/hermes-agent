@@ -402,6 +402,156 @@ def test_dispatch_tick_flags_dropped_schedule(kanban_home, all_assignees_spawnab
         assert kb.get_task(conn, t).status == "scheduled"  # re-parked, not spawned
 
 
+def test_wake_skips_re_scheduled_deadline_under_stale_snapshot(kanban_home, monkeypatch):
+    """A stale waker snapshot must never wake a card whose park was re-scheduled
+    to a LATER deadline after the snapshot was taken: the wake has to confirm
+    the observed deadline is still the card's current one inside the write
+    transaction, not just that the card is parked."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="rescheduled under waker", assignee="ops")
+        past = int(time.time()) - 3600
+        future = int(time.time()) + 7200
+        assert kb.schedule_task(conn, t, until=past) is True
+        # Interleave a concurrent writer between the waker's per-card work and
+        # its wake UPDATE: the card is moved out and re-parked for ``future``
+        # (raw SQL = the out-of-band write class this module guards against).
+        original_reclaim = kb._reclaim_dangling_run
+        fired = []
+
+        def interleaving_writer(c, task_id, **kw):
+            if task_id == t and not fired:
+                fired.append(task_id)
+                c.execute(
+                    "UPDATE tasks SET status = 'scheduled', scheduled_until = ? WHERE id = ?",
+                    (future, task_id),
+                )
+            return original_reclaim(c, task_id, **kw)
+
+        monkeypatch.setattr(kb, "_reclaim_dangling_run", interleaving_writer)
+        assert kb.wake_due_scheduled(conn) == []  # the fresh park must survive
+        task = kb.get_task(conn, t)
+        assert task.status == "scheduled"
+        assert task.scheduled_until == future
+        assert [e.kind for e in kb.list_events(conn, t)].count("woke") == 0
+        # The new deadline owns the card now: it wakes when IT passes.
+        assert kb.wake_due_scheduled(conn, now=future + 1) == [t]
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_wake_backfill_never_clobbers_concurrent_deadline(kanban_home, monkeypatch):
+    """Restoring a legacy marker into ``scheduled_until`` must not overwrite a
+    deadline a concurrent writer parked explicitly after the waker's scan."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="legacy vs explicit", assignee="ops")
+        past = int(time.time()) - 600
+        future = int(time.time()) + 7200
+        assert kb.schedule_task(
+            conn, t, reason=f"SCHEDULED_UNTIL={past} legacy park") is True
+        conn.execute("UPDATE tasks SET scheduled_until = NULL WHERE id = ?", (t,))
+        original_reason = kb._last_scheduled_event_reason
+        fired = []
+
+        def interleaving_marker_read(c, task_id):
+            if task_id == t and not fired:
+                fired.append(task_id)
+                c.execute(
+                    "UPDATE tasks SET scheduled_until = ? WHERE id = ? AND status = 'scheduled'",
+                    (future, task_id),
+                )
+            return original_reason(c, task_id)
+
+        monkeypatch.setattr(kb, "_last_scheduled_event_reason", interleaving_marker_read)
+        assert kb.wake_due_scheduled(conn) == []
+        task = kb.get_task(conn, t)
+        assert task.status == "scheduled"
+        assert task.scheduled_until == future  # explicit deadline kept, marker dropped
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert "woke" not in kinds
+
+
+def test_restore_recovers_repeat_drop_after_repark(kanban_home):
+    """A schedule that was dropped, re-parked and dropped AGAIN must stay
+    recoverable: a ``schedule_loss(action=reparked)`` event continues the park
+    era, it must not read as that era's closing event."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="dropped twice", assignee="ops")
+        future = int(time.time()) + 3600
+        assert kb.schedule_task(conn, t, until=future) is True
+        drop = "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'scheduled'"
+        conn.execute(drop, (t,))
+        assert kb.restore_dropped_schedules(conn) == [t]  # first loss → re-park
+        assert kb.get_task(conn, t).status == "scheduled"
+        conn.execute(drop, (t,))
+        assert kb.restore_dropped_schedules(conn) == [t]  # second loss → STILL recovered
+        assert kb.get_task(conn, t).status == "scheduled"
+        losses = [e for e in kb.list_events(conn, t) if e.kind == "schedule_loss"]
+        assert len(losses) == 2
+        assert all(e.payload["action"] == "reparked" for e in losses)
+        assert kb.claim_task(conn, t) is None  # protection holds
+
+
+def test_restore_repeat_drop_past_due_surfaces_once_then_stops(kanban_home):
+    """A past-due drop is left ready (its run is due NOW) with the loss
+    surfaced — exactly once: the next scan must see the era as closed, never
+    loop re-surfacing it."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="dropped twice past", assignee="ops")
+        past = int(time.time()) - 60
+        assert kb.schedule_task(conn, t, until=past) is True
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'scheduled'", (t,))
+        assert kb.restore_dropped_schedules(conn) == [t]
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.restore_dropped_schedules(conn) == []  # surfaced once: no loop
+
+
+def test_schedule_invalid_explicit_until_rejected_not_timerless(kanban_home):
+    """An explicit but unreadable ``until`` must be rejected — never silently
+    parked without a timer, not even when the reason carries a valid marker the
+    bad value would shadow. A bad MARKER (no explicit until) keeps the legacy
+    lenient contract: external-event park."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="bad explicit", assignee="ops")
+        with pytest.raises(ValueError):
+            kb.schedule_task(
+                conn, t, until="not-a-time",
+                reason="SCHEDULED_UNTIL=2030-01-01T00:00:00+03:00")
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"  # unchanged: the park never happened
+        assert task.scheduled_until is None
+
+        t2 = kb.create_task(conn, title="bad marker", assignee="ops")
+        assert kb.schedule_task(conn, t2, reason="SCHEDULED_UNTIL=eventually") is True
+        task2 = kb.get_task(conn, t2)
+        assert task2.status == "scheduled"
+        assert task2.scheduled_until is None
+
+
+def test_restore_scan_cost_bounded_not_per_ready_card(kanban_home):
+    """The reclaim-phase drop scan must stay a batched query over ready cards:
+    per-card event lookups make every dispatcher tick cost O(ready cards)."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="the one dropped", assignee="ops")
+        assert kb.schedule_task(conn, t, until=int(time.time()) + 3600) is True
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'scheduled'", (t,))
+        for i in range(40):
+            kb.create_task(conn, title=f"plain ready {i}", assignee="ops")
+
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        try:
+            assert kb.restore_dropped_schedules(conn) == [t]
+        finally:
+            conn.set_trace_callback(None)
+        event_reads = [s for s in statements if "FROM task_events" in s]
+        # One batched epoch scan finds the single dropped card; plain ready
+        # cards without schedule history cost nothing.
+        assert len(event_reads) <= 3, (
+            f"per-card event reads leaked into the tick ({len(event_reads)}): "
+            f"{event_reads[:4]}")
+
+
 
 
 

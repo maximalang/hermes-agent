@@ -906,8 +906,13 @@ def _handle_schedule(args: dict, **kw) -> str:
                "goal_mode tasks cannot be scheduled: use kanban_block with kind "
                f"in {sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} for a genuine external "
                "blocker, or kanban_complete so the completion judge can evaluate it.")
-        ok = kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), until=raw_until)
+        try:
+            ok = kb.schedule_task(
+                conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), until=raw_until)
+        except ValueError as exc:
+            # An explicit-but-unreadable until must surface as a tool error,
+            # never land the card in a timerless scheduled park.
+            _check(False, str(exc))
         _check(ok, f"could not schedule {tid} (unknown id or not in todo/ready/running/blocked)")
         return _ok_landed(kb, conn, tid, "scheduled", reason=reason)
 
