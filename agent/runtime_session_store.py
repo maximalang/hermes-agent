@@ -47,6 +47,16 @@ class WorkerPersistenceError(RuntimeError):
     pass
 
 
+# The owner's write side may legitimately hold a worker receipt for as long as its
+# transcript-write patience (``hermes_state.SessionDB._TRANSCRIPT_WRITE_PATIENCE_S``, 60 s):
+# a busy SQLite writer, a big transcript commit or a slow host can delay the reply while the
+# store stays healthy. The receipt budget must exceed that patience or a slow-but-healthy
+# owner makes the worker abort the turn as a failed save (interpreter exit 1 ->
+# ``lose_admission_worker`` fences the admission ``unknown`` -> the kanban submitter dies
+# with "Kanaban execution unknown"; incident 2026-11-07 08:05/08:14, two cards gave_up).
+RECEIPT_BUDGET_S = 90.0
+
+
 def _caller_summary(limit=8):
     """module:function:line of the frames above this store (its own frames skipped), never
     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""
@@ -194,7 +204,7 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = link.receive(RECEIPT_BUDGET_S)
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()
@@ -481,8 +491,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self._apply('session.sidecars', {'patch': patch})
 
     def update_session_tool_names(self, session_id, pin):
-        # The tools[] freeze pin ({"version", "tools"}; None clears): without it every fresh worker
-        # re-probes check_fns and a config flip between turns silently forks the cached prefix.
+        # The tools[] freeze pin ({"version", "tools"[, "delegation_backend"]}; None clears): without it every
+        # fresh worker re-probes check_fns and a config flip between turns silently forks the cached prefix.
         self._session(session_id)
         self._apply('session.tools', {'tool_names': pin})
 
