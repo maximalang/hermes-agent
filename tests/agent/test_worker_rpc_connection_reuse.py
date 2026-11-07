@@ -218,9 +218,20 @@ def test_idle_broadcasts_past_the_receive_high_water_mark_keep_the_connection(ow
     assert (owner.connections, owner.tickets) == (1, 1)
 
 
+def test_receipt_budget_exceeds_the_owners_write_patience():
+    """The worker's per-call deadline must outlast the owner's legitimate handling time: the
+    store may hold a write receipt for ``_TRANSCRIPT_WRITE_PATIENCE_S`` (a busy SQLite writer,
+    a big transcript commit) while staying healthy. A budget below that patience turns every
+    slow commit into a "failed save" that kills the turn (and, via the unknown fence, the
+    kanban submitter) — the 2026-11-07 crash waves."""
+    from agent.runtime_session_store import RECEIPT_BUDGET_S
+    from hermes_state import SessionDB
+    assert RECEIPT_BUDGET_S > SessionDB._TRANSCRIPT_WRITE_PATIENCE_S
+
+
 def test_owner_stall_shorter_than_the_receipt_budget_does_not_fail_on_a_ping_deadline(owner, tmp_path, monkeypatch):
-    """The receipt budget (20 s) is the only per-call deadline: a library keepalive whose pong is held
-    by the same stall must not close the connection first. The library defaults (20 s / 20 s) are
+    """The receipt budget (``RECEIPT_BUDGET_S``) is the only per-call deadline: a library keepalive whose
+    pong is held by the same stall must not close the connection first. The library defaults (20 s / 20 s) are
     scaled down so an inherited keepalive would fire inside the stall."""
     from websockets.sync import client
     from agent.runtime_session_store import WorkerRPC
